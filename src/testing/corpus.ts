@@ -2,7 +2,7 @@
 // is the oracle (decomposition §12): tests read it, they never edit it.
 
 import { readFileSync, readdirSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export type CorpusEntry = {
@@ -12,7 +12,10 @@ export type CorpusEntry = {
   frame: Record<string, unknown>
 }
 
-export const corpusRoot = fileURLToPath(new URL('../../research/corpus/', import.meta.url))
+// From the module's own path as a STRING: consumers' renderer tests run under
+// happy-dom, which replaces the global URL class, and Node's fileURLToPath
+// rejects a happy-dom URL object ("must be of scheme file").
+export const corpusRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'research', 'corpus')
 
 export function corpusScenarios(): string[] {
   if (!existsSync(corpusRoot)) return []
