@@ -203,3 +203,19 @@ describe('URLs', () => {
     expect(() => readAuthorizationCode('http://127.0.0.1:5000/cb?code=abc&state=forged', pkce.state)).toThrow(/state/)
   })
 })
+
+describe('HTTP deadline (owner bundle 2026-10-14T16-26-49)', () => {
+  it('turns a request that never answers into a transport ETIMEDOUT instead of hanging', async () => {
+    const { mintWsTicket: mint, HTTP_TIMEOUT_MS: limit } = await import('./index.js')
+    expect(limit).toBe(20_000)
+    // A fetch that only settles when its signal aborts: the shape of a
+    // half-open route. The deadline is shortened through the signal itself.
+    const hanging = (_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      expect(signal).toBeDefined()
+      signal!.addEventListener('abort', () => reject(Object.assign(new Error('timed out'), { name: 'TimeoutError' })))
+      setTimeout(() => (signal as AbortSignal & { dispatchEvent(e: Event): boolean }).dispatchEvent(new Event('abort')), 10)
+    })
+    await expect(mint({ baseUrl: 'https://vps.example', accessToken: 'a' }, hanging)).rejects.toMatchObject({ kind: 'transport', causeCode: 'ETIMEDOUT' })
+  })
+})

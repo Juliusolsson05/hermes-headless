@@ -163,10 +163,22 @@ export function readAuthorizationCode(callbackUrl: string, expectedState: string
   return code
 }
 
+/**
+ * Every HTTP call gives up after this long. WHY (owner's debug bundle
+ * 2026-10-14T16-26-49): with no deadline, a ticket mint stuck on a dead
+ * route (a gateway restarting behind Traefik) held the consumer's single
+ * reconnect attempt open indefinitely, and the pane stayed "reconnecting"
+ * until a manual reload. 20 s is above Hermes' own 15 s connect budget.
+ */
+export const HTTP_TIMEOUT_MS = 20_000
+
 async function send(fetchImpl: FetchLike, url: string, init: RequestInit): Promise<Response> {
   try {
-    return await fetchImpl(url, { ...init, redirect: 'manual' })
+    return await fetchImpl(url, { ...init, redirect: 'manual', signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS) })
   } catch (error) {
+    if ((error as { name?: string })?.name === 'TimeoutError') {
+      throw new HermesAuthError('transport', `Hermes at ${new URL(url).origin} did not answer within ${HTTP_TIMEOUT_MS / 1000} s.`, undefined, 'ETIMEDOUT')
+    }
     // undici's fetch throws `TypeError: fetch failed` with the socket error as
     // `cause`; the code is what lets the UI say "refused" vs "no such host".
     const cause = (error as { cause?: { code?: string } })?.cause
