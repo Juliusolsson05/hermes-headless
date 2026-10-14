@@ -1,10 +1,16 @@
 // Stage 0 recorder (decomposition §7): drive a REAL `hermes serve` through each
 // scenario and write every frame, both directions, to research/corpus/.
 //
-// Usage: npm run record -- [S1 S3 …]   (no arguments = every scenario)
+// Usage:
+//   HERMES_LIVE_RUNTIME=<runtime> node --import tsx research/record-wire.mts \
+//     [--release v0.22.0] [S1 S3 …]      (no scenario ids = every scenario)
 //
-// The backend is the live harness (testing/live-hermes): Hermes v0.21.7 from
-// the pinned reference source, the auth gate ON (password provider), and the
+// WHY `node --import tsx` and not the tsx CLI: with a long TMPDIR the tsx CLI
+// fails to bind its IPC pipe (`listen EINVAL … tsx-501/….pipe`, report r8).
+//
+// The backend is the live harness (testing/live-hermes): the Hermes release
+// under HERMES_LIVE_RUNTIME (default: the pinned v0.21.7 reference source in
+// .cache/hermes-runtime), the auth gate ON (password provider), and the
 // scripted model (testing/scripted-model). S2 (Nous OAuth) is not recordable
 // here; it needs a real Nous account and a registered dashboard.
 //
@@ -17,19 +23,31 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { startScriptedModel } from '../src/testing/scripted-model/server.js'
+import { startScriptedModel, type ScriptedModelServer } from '../src/testing/scripted-model/server.js'
 import { removeLiveHome, startLiveHermes, type LiveHermes, type LiveHermesOptions } from '../src/testing/live-hermes/harness.js'
-import { RawPeer, eventType, mintTicket, passwordNativeLogin, probe, refreshTokens, type Tokens } from './driver.js'
+import { startLaneHermes, type LaneHermes } from '../src/testing/live-hermes/lane.js'
+import { RawPeer, eventType, mintTicket, passwordNativeLogin, probe, refreshTokens, restCall, type Tokens } from './driver.js'
+import { parseReleaseArgs, readProvenance, recordingFileName } from './provenance.js'
 import { WireTap } from './tap.js'
 
 const corpusRoot = fileURLToPath(new URL('./corpus/', import.meta.url))
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-type Ctx = { hermes: LiveHermes; tap: WireTap; tokens: Tokens }
+type Ctx = {
+  hermes: LiveHermes
+  tap: WireTap
+  tokens: Tokens
+  /** The scripted model, so a scenario can read what Hermes sent it (S23, S21). */
+  model: ScriptedModelServer
+  /** Extra processes a scenario started (S24's gateway); stopped in `finally`. */
+  cleanup?: () => Promise<void>
+  /** The gateway + stand-in setup, for scenarios booted with `boot: 'lane'`. */
+  lane?: LaneHermes
+}
 
-async function connect(ctx: Ctx): Promise<RawPeer> {
+async function connect(ctx: Ctx, label?: string): Promise<RawPeer> {
   const ticket = await mintTicket(ctx.tap, ctx.hermes.baseUrl, ctx.tokens.access_token)
-  const peer = new RawPeer(ctx.tap)
+  const peer = new RawPeer(ctx.tap, label)
   const url = new URL('/api/ws', ctx.hermes.baseUrl)
   url.protocol = 'ws:'
   url.searchParams.set('ticket', ticket)
@@ -59,7 +77,19 @@ async function resumeInNewConnection(ctx: Ctx, stored: string, extra: Record<str
   return { peer, result }
 }
 
-type Scenario = { id: string; title: string; options?: Partial<LiveHermesOptions>; run(ctx: Ctx): Promise<void> }
+type Scenario = {
+  id: string
+  title: string
+  options?: Partial<LiveHermesOptions>
+  /**
+   * Excluded from a bare `record` run. S25 needs a v0.20.4 runtime, where every
+   * other scenario fails at the handshake by design, so it only runs when named.
+   */
+  onlyWhenNamed?: boolean
+  /** `lane`: boot `hermes gateway run` + serve (src/testing/live-hermes/lane.ts) instead of serve alone. */
+  boot?: 'serve' | 'lane'
+  run(ctx: Ctx): Promise<void>
+}
 
 const scenarios: Scenario[] = [
   {
@@ -384,11 +414,11 @@ const scenarios: Scenario[] = [
     id: 'S16',
     title: 'two clients on one session; busy-session prompt',
     async run(ctx) {
-      const a = await connect(ctx)
+      const a = await connect(ctx, 'A')
       const { sid, stored } = await createSession(a)
       await prompt(a, sid, '[[hh:plain]] Warm up.')
       await turnComplete(a, sid)
-      const b = await connect(ctx)
+      const b = await connect(ctx, 'B')
       await b.call('session.resume', { session_id: stored, cols: 96 })
       await prompt(a, sid, '[[hh:slow]] Long one.')
       await a.waitFor((frame) => eventType(frame) === 'message.delta', 60_000)
@@ -400,21 +430,336 @@ const scenarios: Scenario[] = [
       b.close()
     },
   },
+  {
+    id: 'S17',
+    title: 'commands.catalog + complete.slash with a quick command, a plugin-free skill and the bundled skills',
+    options: {
+      extraConfigYaml: [
+        // Two user quick commands, one per type the catalog distinguishes
+        // (tui_gateway/methods_tools.py _catalog_quick_commands /
+        // _dispatch_quick): `exec` runs a shell command, `alias` rewrites.
+        'quick_commands:',
+        '  hhq:',
+        '    type: exec',
+        '    command: echo hh-quick-ok',
+        '    description: Scripted quick command',
+        '  hhalias:',
+        '    type: alias',
+        '    target: /help',
+      ],
+    },
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      // The skill is the harness's plugin-free `hh-secret` (HERMES_HOME/skills).
+      await peer.call('commands.catalog', { session_id: sid })
+      for (const text of ['/', '/hh', '/hhq', '/re', '/bt', '/compr', '/restart', '/hh-secret']) {
+        await peer.call('complete.slash', { text, session_id: sid }).catch((error: Error) => ctx.tap.note(`complete.slash ${text} failed`, { message: error.message }))
+      }
+      // How the quick commands and a terminal-only command actually run.
+      for (const command of ['hhq', 'hhalias', 'restart']) {
+        await peer.call('slash.exec', { session_id: sid, command }).catch((error: Error) => ctx.tap.note(`slash.exec ${command} failed`, { message: error.message }))
+        await peer.call('command.dispatch', { session_id: sid, name: command }).catch((error: Error) => ctx.tap.note(`command.dispatch ${command} failed`, { message: error.message }))
+      }
+      peer.close()
+    },
+  },
+  {
+    id: 'S18',
+    title: '/bg via prompt.background → background.complete (idle session, then mid-turn)',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      await prompt(peer, sid, '[[hh:plain]] Warm up.')
+      await turnComplete(peer, sid)
+      const first = peer.waitFor((frame) => eventType(frame) === 'background.complete', 60_000)
+      await peer.call('prompt.background', { session_id: sid, text: '[[hh:say-bg-idle]] Background task on an idle session.' })
+      await first
+      ctx.tap.note('background while a turn is running')
+      await prompt(peer, sid, '[[hh:slow-main]] A long main turn.')
+      await peer.waitFor((frame) => eventType(frame) === 'message.delta', 60_000)
+      const second = peer.waitFor((frame) => eventType(frame) === 'background.complete', 60_000)
+      await peer.call('prompt.background', { session_id: sid, text: '[[hh:say-bg-busy]] Background task during a turn.' })
+      await second
+      await turnComplete(peer, sid)
+      await sleep(1000)
+      await peer.call('session.history', { session_id: sid })
+      peer.close()
+    },
+  },
+  {
+    id: 'S19',
+    title: '/btw via prompt.btw → btw.complete (with history; nothing written to the transcript)',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      await prompt(peer, sid, '[[hh:plain]] Remember the probe colour is blue.')
+      await turnComplete(peer, sid)
+      const done = peer.waitFor((frame) => eventType(frame) === 'btw.complete', 60_000)
+      await peer.call('prompt.btw', { session_id: sid, text: '[[hh:say-btw]] What colour did I mention?' })
+      await done
+      await sleep(1000)
+      await peer.call('session.history', { session_id: sid })
+      peer.close()
+    },
+  },
+  {
+    id: 'S20',
+    title: '/compress via session.compress: too small (noop), then a real compression, then resume elsewhere',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid, stored } = await createSession(peer)
+      await prompt(peer, sid, '[[hh:plain]] One short turn.')
+      await turnComplete(peer, sid)
+      ctx.tap.note('compress with fewer than MIN_MESSAGES=4 messages (expected noop)')
+      await peer.call('session.compress', { session_id: sid }).catch((error: Error) => ctx.tap.note('small compress failed', { message: error.message }))
+      // Many turns, not a few bulky ones. The first attempt (5 turns of ~5 KB
+      // each) came back `refused_would_grow`: with a 256k context the tail
+      // budget (threshold × 0.2 ≈ 25k tokens, context_compressor.py
+      // tail_token_budget) keeps nearly everything, the anchors keep the
+      // last user/assistant rows, and the summary wrapper then outweighs the
+      // tiny middle. S12's 60 short turns compressed fine (removed 108), so
+      // this uses enough short turns to give the compressor a real middle.
+      for (let turn = 1; turn <= 30; turn += 1) {
+        await prompt(peer, sid, `[[hh:plain]] Turn ${turn} with a little padding so the middle has weight. ${'pad '.repeat(40)}`)
+        await turnComplete(peer, sid)
+      }
+      await sleep(1000)
+      await peer.call('session.compress', { session_id: sid }).catch((error: Error) => ctx.tap.note('compress failed', { message: error.message }))
+      await sleep(2000)
+      await peer.call('session.history', { session_id: sid })
+      peer.close()
+      const other = await resumeInNewConnection(ctx, stored)
+      await other.peer.call('session.history', { session_id: String(other.result.session_id) })
+      other.peer.close()
+    },
+  },
+  {
+    id: 'S21',
+    title: 'notification.show/clear (credit headers), memory write, review.summary (/refine), subagent.start/complete (delegate_task)',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      ctx.tap.note('notifications: depleted credit headers, then restored')
+      await prompt(peer, sid, '[[hh:credits-out]] Turn with depleted credit headers.')
+      await turnComplete(peer, sid)
+      await sleep(500)
+      await prompt(peer, sid, '[[hh:credits-ok]] Turn with restored credit headers.')
+      await turnComplete(peer, sid)
+      await sleep(500)
+      ctx.tap.note('memory write in an ordinary turn')
+      await prompt(peer, sid, '[[hh:memwrite]] Remember something.')
+      await turnComplete(peer, sid)
+      ctx.tap.note('review.summary via /refine (a background review fork that writes memory)')
+      const review = peer.waitFor((frame) => eventType(frame) === 'review.summary', 90_000)
+      await peer.call('slash.exec', { session_id: sid, command: 'refine [[hh:review]]' }).catch((error: Error) => ctx.tap.note('slash.exec refine failed', { message: error.message }))
+      await review.catch((error: Error) => ctx.tap.note('no review.summary', { message: error.message }))
+      ctx.tap.note('delegate_task: subagent.start / subagent.complete')
+      const subDone = peer.waitFor((frame) => eventType(frame) === 'subagent.complete', 120_000)
+      await prompt(peer, sid, '[[hh:delegate]] Delegate a task.')
+      await turnComplete(peer, sid)
+      await subDone.catch((error: Error) => ctx.tap.note('no subagent.complete', { message: error.message }))
+      // Background delegation re-enters the parent with the child's result
+      // as a new turn; give it time to land so the recording shows it.
+      await sleep(8000)
+      await peer.call('session.history', { session_id: sid })
+      peer.close()
+    },
+  },
+  {
+    id: 'S22',
+    title: 'two clients: client B answers an approval; what client A sees (the r4 F4 shape)',
+    async run(ctx) {
+      const a = await connect(ctx, 'A')
+      const { sid, stored } = await createSession(a)
+      await prompt(a, sid, '[[hh:plain]] Warm up.')
+      await turnComplete(a, sid)
+      const b = await connect(ctx, 'B')
+      const resumed = await b.call<Record<string, unknown>>('session.resume', { session_id: stored, cols: 96 })
+      ctx.tap.note('B attached', { bSid: resumed.session_id, aSid: sid })
+      // A never answers; B answers whatever approval reaches it.
+      a.onServerRequest = (frame) => (frame.method === 'approval' ? 'defer' : undefined)
+      let bAnswered = false
+      b.onServerRequest = (frame) => {
+        if (frame.method !== 'approval') return undefined
+        bAnswered = true
+        ctx.tap.note('B received the approval request and answers it')
+        return { choice: 'once' }
+      }
+      const aDone = turnComplete(a, sid)
+      await prompt(a, sid, '[[hh:approval]] Delete the probe directory.')
+      const approval = await a.waitFor((frame) => frame.method === 'approval', 60_000)
+      await sleep(2000)
+      if (!bAnswered) {
+        // The live request went only to A's socket; B answers through the
+        // RPC Hermes provides for answering from another client.
+        ctx.tap.note('approval did not reach B; B answers via request.answer')
+        await b.call('request.answer', { id: approval.id, result: { choice: 'once' } }).catch((error: Error) =>
+          ctx.tap.note('request.answer from B failed', { message: error.message }))
+      }
+      await aDone
+      await sleep(3000)
+      a.close()
+      b.close()
+    },
+  },
+  {
+    id: 'S23',
+    title: 'idle prompt.submit with queued:true vs without, same text, two fresh sessions (plan H2)',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      // A warm-up session first. Without it the FIRST variant carries
+      // Hermes' one-time "[System note: This is the user's very first message
+      // ever…]" in its model input (seen in the first S23 run) and its session
+      // title is the un-suffixed one — differences caused by session order,
+      // not by `queued`, which would make the comparison meaningless.
+      const warm = await createSession(peer)
+      const warmDone = turnComplete(peer, warm.sid)
+      await prompt(peer, warm.sid, '[[hh:plain]] Warm-up session.')
+      await warmDone
+      await sleep(3000)
+      ctx.model.requests.length = 0
+      for (const queued of [true, false]) {
+        ctx.tap.note('variant', { queued })
+        const { sid } = await createSession(peer)
+        const done = turnComplete(peer, sid)
+        await peer.call('prompt.submit', { session_id: sid, text: '[[hh:plain]] Identical idle prompt.', ...(queued ? { queued: true } : {}) })
+        await done
+        await sleep(1500)
+        await peer.call('session.history', { session_id: sid })
+        ctx.tap.note('variant finished', { queued })
+      }
+      // What Hermes sent the model for each variant (the other half of
+      // "equivalent"): same marker, same message roles.
+      ctx.tap.note('model requests', ctx.model.requests
+        .filter((request) => request.path.endsWith('/chat/completions'))
+        .map((request) => {
+          const body = (request.body ?? {}) as { messages?: Array<{ role: string; content?: unknown }>; stream?: boolean }
+          return { stream: body.stream === true, roles: (body.messages ?? []).map((message) => message.role), lastUser: JSON.stringify((body.messages ?? []).filter((message) => message.role === 'user').at(-1)?.content ?? null).slice(0, 200) }
+        }))
+      peer.close()
+    },
+  },
+  {
+    id: 'S24',
+    title: 'POST /api/gateway/restart against a local gateway process; action status; /api/status until gateway_running returns',
+    boot: 'lane',
+    async run(ctx) {
+      const lane = ctx.lane!
+      const base = ctx.hermes.baseUrl
+      const token = ctx.tokens.access_token
+      await restCall(ctx.tap, base, '/api/status', token)
+      const originalPid = lane.gatewayPid()
+      ctx.tap.note('gateway before restart', { pidKnownToRecorder: originalPid !== undefined })
+      const restart = await restCall(ctx.tap, base, '/api/gateway/restart', token, { method: 'POST' })
+      const restartPid = (restart.body as { pid?: number } | undefined)?.pid
+      // The replacement gateway runs INSIDE the dashboard's detached action
+      // child (hermes_cli/gateway.py _cmd_restart manual path on macOS), i.e.
+      // outside every process handle this recorder owns. Kill it in cleanup
+      // so no `hermes gateway` outlives the run (the next restart's orphan
+      // reaper scans every process of this user for gateway argv).
+      ctx.cleanup = async () => {
+        if (typeof restartPid === 'number') {
+          try {
+            process.kill(restartPid, 'SIGTERM')
+            await sleep(4000)
+            process.kill(restartPid, 'SIGKILL')
+          } catch {
+            // already gone
+          }
+        }
+      }
+      let sawDown = false
+      let back = false
+      const end = Date.now() + 120_000
+      while (Date.now() < end) {
+        await sleep(1000)
+        const status = await restCall(ctx.tap, base, '/api/status', token)
+        const running = (status.body as { gateway_running?: boolean } | undefined)?.gateway_running
+        if (running === false) sawDown = true
+        if (running === true && (sawDown || Date.now() > end - 100_000)) {
+          back = true
+          break
+        }
+      }
+      ctx.tap.note('gateway_running after restart', { sawDown, back })
+      await restCall(ctx.tap, base, '/api/actions/gateway-restart/status?lines=40', token)
+      // The decisive check that a gateway is really back: a phone message is
+      // answered by the replacement (it reads the same home's .env).
+      ctx.tap.note('phone message after restart')
+      await lane.dm('[[hh:say-phone-after-restart]] Is the gateway back?')
+      await lane.waitPhoneText('ANSWER phone-after-restart', undefined, 90_000)
+        .then(() => ctx.tap.note('phone answered after restart'))
+        .catch((error: Error) => ctx.tap.note('phone NOT answered after restart', { message: error.message }))
+      ctx.tap.note('second restart inside the 10 s coalescing cooldown')
+      await restCall(ctx.tap, base, '/api/gateway/restart', token, { method: 'POST' })
+      await restCall(ctx.tap, base, '/api/actions/gateway-restart/status?lines=40', token)
+    },
+  },
+  {
+    id: 'S25',
+    title: 'v0.20.4 handshake: ticket → upgrade → gateway.ready → client.capabilities answers -32601',
+    onlyWhenNamed: true,
+    // See LiveHermesOptions.bindHost: the only way to engage v0.20.4's auth
+    // gate (as on the VPS) while staying loopback-only.
+    options: { bindHost: 'localhost.' },
+    async run(ctx) {
+      const ticket = await mintTicket(ctx.tap, ctx.hermes.baseUrl, ctx.tokens.access_token)
+      const peer = new RawPeer(ctx.tap)
+      const url = new URL('/api/ws', ctx.hermes.baseUrl)
+      url.protocol = 'ws:'
+      url.searchParams.set('ticket', ticket)
+      await peer.open(url.toString())
+      await peer.waitFor((frame) => eventType(frame) === 'gateway.ready', 15_000, true)
+      await peer.call('client.capabilities', { server_requests: true }).catch((error: Error) =>
+        ctx.tap.note('client.capabilities failed', { message: error.message }))
+      // What the old server does with the next calls the client would make
+      // if it ignored the handshake error (r1: v0.20.4 also lacks
+      // session.events.since and request.answer).
+      await peer.call('session.events.since', { session_id: 'none', last_seen: 0 }).catch((error: Error) =>
+        ctx.tap.note('session.events.since failed', { message: error.message }))
+      await sleep(500)
+      peer.close()
+      await Promise.race([peer.closed, sleep(2000)])
+    },
+  },
 ]
 
-const wanted = process.argv.slice(2)
-const selected = wanted.length ? scenarios.filter((scenario) => wanted.includes(scenario.id)) : scenarios
+// `--release <tag>` names the Hermes release under HERMES_LIVE_RUNTIME (default
+// v0.21.7, the release the original corpus and every existing test use). The
+// provenance note's commit comes from the runtime itself (research/
+// provenance.ts), and files are named `<release>-<run id>.jsonl` so releases
+// sit side by side in one scenario directory.
+const { release, rest: wanted } = parseReleaseArgs(process.argv.slice(2))
+const provenance = readProvenance(release)
+const selected = wanted.length ? scenarios.filter((scenario) => wanted.includes(scenario.id)) : scenarios.filter((scenario) => !scenario.onlyWhenNamed)
+if (wanted.length && selected.length !== wanted.length) {
+  const known = new Set(scenarios.map((scenario) => scenario.id))
+  throw new Error(`unknown scenario(s): ${wanted.filter((id) => !known.has(id)).join(', ')}`)
+}
 const runId = new Date().toISOString().replace(/[:.]/g, '-')
 for (const scenario of selected) {
   const model = await startScriptedModel()
-  const hermes = await startLiveHermes({ modelUrl: model.url, ...scenario.options })
+  // S24 needs a gateway process next to serve; the lane harness is exactly
+  // that (a real `hermes gateway run` + serve on one home, Telegram pointed
+  // at upstream's stand-in), so it is reused rather than duplicated.
+  const lane = scenario.boot === 'lane' ? await startLaneHermes({ modelUrl: model.url }) : undefined
+  const hermes = lane ? lane.serve : await startLiveHermes({ modelUrl: model.url, ...scenario.options })
   const dir = join(corpusRoot, scenario.id)
   mkdirSync(dir, { recursive: true })
-  const tap = new WireTap(join(dir, `${runId}.jsonl`))
-  tap.note(scenario.title, { scenario: scenario.id, hermesSource: 'v0.21.7 71d34bad', options: scenario.options ?? {} })
+  const tap = new WireTap(join(dir, recordingFileName(release, runId)))
+  tap.note(scenario.title, {
+    scenario: scenario.id,
+    release: provenance.release,
+    sourceCommit: provenance.sourceCommit,
+    // Kept for readers of the original v0.21.7 files, which only had this.
+    hermesSource: `${provenance.release} ${provenance.sourceCommit.slice(0, 8)}`,
+    recordedAt: new Date().toISOString(),
+    options: scenario.options ?? {},
+  })
   const started = Date.now()
   // ctx.hermes is replaced by S11's restart; stop whichever process is current.
-  const ctx: Ctx = { hermes, tap, tokens: undefined as unknown as Tokens }
+  const ctx: Ctx = { hermes, tap, tokens: undefined as unknown as Tokens, model, lane }
   try {
     await probe(tap, hermes.baseUrl)
     ctx.tokens = await passwordNativeLogin(tap, hermes.baseUrl, hermes.username, hermes.password)
@@ -424,8 +769,11 @@ for (const scenario of selected) {
   } catch (error) {
     tap.note('scenario failed', { message: error instanceof Error ? error.message : String(error) })
     console.log(`${scenario.id} FAILED: ${error instanceof Error ? error.message : String(error)}`)
+    process.exitCode = 1
   } finally {
-    await ctx.hermes.stop()
+    await ctx.cleanup?.()
+    if (lane) await lane.stop()
+    else await ctx.hermes.stop()
     await model.close()
     removeLiveHome(hermes.home)
   }

@@ -23,7 +23,7 @@ function b64url(buffer: Buffer): string {
   return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function tapFetch(tap: WireTap, url: string, init: RequestInit = {}): Promise<Response> {
+export async function tapFetch(tap: WireTap, url: string, init: RequestInit = {}): Promise<Response> {
   const response = await fetch(url, { ...init, redirect: 'manual' })
   const text = await response.clone().text()
   let body: unknown = text
@@ -111,6 +111,39 @@ export async function mintTicket(tap: WireTap, baseUrl: string, accessToken: str
   return ((await response.json()) as { ticket: string }).ticket
 }
 
+/**
+ * A dashboard REST call authenticated the way the package will call it: the
+ * native-PKCE access token as `Authorization: Bearer` (hermes_cli/
+ * dashboard_auth/middleware.py, "RFC 8252 native-app bearer path"), no
+ * cookie. Recorded through the tap like every other exchange (the header
+ * value is masked same-length), so lane tests can replay the exact bodies
+ * of `/api/sessions?source=telegram…` and `…/latest-descendant`.
+ */
+export async function restCall(
+  tap: WireTap,
+  baseUrl: string,
+  path: string,
+  accessToken: string | undefined,
+  init: { method?: string; body?: unknown } = {},
+): Promise<{ status: number; body: unknown }> {
+  const headers: Record<string, string> = {}
+  if (accessToken !== undefined) headers.authorization = `Bearer ${accessToken}`
+  if (init.body !== undefined) headers['content-type'] = 'application/json'
+  const response = await tapFetch(tap, new URL(path, baseUrl).toString(), {
+    method: init.method ?? 'GET',
+    headers,
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  })
+  const text = await response.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    // non-JSON bodies stay text
+  }
+  return { status: response.status, body }
+}
+
 export async function probe(tap: WireTap, baseUrl: string): Promise<void> {
   for (const path of ['/api/status', '/api/auth/providers', '/api/health']) {
     await tapFetch(tap, new URL(path, baseUrl).toString())
@@ -129,30 +162,39 @@ export class RawPeer {
   private readonly pending = new Map<string, Pending>()
   readonly frames: Array<Record<string, unknown>> = []
   private readonly waiters: Array<{ match: (frame: Record<string, unknown>) => boolean; resolve: (frame: Record<string, unknown>) => void }> = []
+  /** The id of the most recent `call` (read right after calling, before awaiting). */
+  lastId = ''
+  /**
+   * Observers of every inbound frame, after it is tapped (lane recordings
+   * react to the payload-free global `sessions.changed`, as a pane would).
+   */
+  readonly listeners: Array<(frame: Record<string, unknown>) => void> = []
   /** Server→client request handler; the default declines with -32601. */
   onServerRequest: (frame: Record<string, unknown>) => unknown | undefined = () => undefined
   closed: Promise<{ code: number; reason: string }> = Promise.resolve({ code: 0, reason: '' })
 
-  constructor(private readonly tap: WireTap) {}
+  /** `label` tags every frame of this socket in the tap (see TapEntry.peer). */
+  constructor(private readonly tap: WireTap, private readonly label?: string) {}
 
   async open(url: string): Promise<void> {
     this.socket = new WebSocket(url)
     this.closed = new Promise((resolve) => {
       this.socket.addEventListener('close', (event) => {
-        this.tap.write('in', 'ws-close', { code: event.code, reason: event.reason })
+        this.tap.write('in', 'ws-close', { code: event.code, reason: event.reason }, this.label)
         resolve({ code: event.code, reason: event.reason })
       })
     })
     this.socket.addEventListener('message', (event) => {
       const text = typeof event.data === 'string' ? event.data : String(event.data)
       const frame = JSON.parse(text) as Record<string, unknown>
-      this.tap.write('in', 'ws', frame)
+      this.tap.write('in', 'ws', frame, this.label)
       this.frames.push(frame)
       this.dispatch(frame)
+      for (const listener of this.listeners) listener(frame)
     })
     await new Promise<void>((resolve, reject) => {
       this.socket.addEventListener('open', () => {
-        this.tap.write(null, 'ws-open', { url })
+        this.tap.write(null, 'ws-open', { url }, this.label)
         resolve()
       }, { once: true })
       this.socket.addEventListener('error', () => reject(new Error('ws error before open')), { once: true })
@@ -185,12 +227,13 @@ export class RawPeer {
   }
 
   send(frame: Record<string, unknown>): void {
-    this.tap.write('out', 'ws', frame)
+    this.tap.write('out', 'ws', frame, this.label)
     this.socket.send(JSON.stringify(frame))
   }
 
   call<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     const id = `r${this.nextId++}`
+    this.lastId = id
     const promise = new Promise<unknown>((resolve, reject) => this.pending.set(id, { resolve, reject }))
     this.send({ jsonrpc: '2.0', id, method, params })
     return promise as Promise<T>

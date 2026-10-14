@@ -7,7 +7,7 @@
 // tap's `x` mask, and is not on the allow-list of known public shapes (session
 // ids, request ids, epochs). Exit code 1 on any finding.
 
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -31,7 +31,12 @@ function entropyish(value: string): boolean {
 }
 
 /** Personal machine paths must never reach the corpus (tap.ts rewrites them). */
-const PERSONAL = [/\/Users\/[^/]+\//, /\/private\/var\/folders\//, /\/home\/(?!dev\b)[^/]+\//]
+const PERSONAL = [
+  /\/Users\/[^/]+\//, /\/private\/var\/folders\//, /\/home\/(?!dev\b)[^/]+\//,
+  // The Telegram stand-in's bot token (fake, but a bot token in a fixture
+  // must never look normal) and the stand-in's Bot API URLs, which carry it.
+  /\d{6,}:[A-Za-z0-9_-]{6,}/, /\/bot\d+:/,
+]
 
 const findings: string[] = []
 function visit(value: unknown, where: string): void {
@@ -51,6 +56,8 @@ function visit(value: unknown, where: string): void {
 
 let files = 0
 for (const scenario of readdirSync(root)) {
+  // MANIFEST-<release>.json files sit beside the scenario directories.
+  if (!statSync(join(root, scenario)).isDirectory()) continue
   for (const file of readdirSync(join(root, scenario)).filter((name) => name.endsWith('.jsonl'))) {
     files += 1
     const lines = readFileSync(join(root, scenario, file), 'utf8').trim().split('\n')

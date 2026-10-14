@@ -1,0 +1,304 @@
+{
+  "release": "v0.22.0",
+  "sourceCommit": "e06df9c2eae6901f4c88f464e0ae6e753c0428b8",
+  "contract": 8,
+  "scenarios": [
+    {
+      "id": "S1",
+      "title": "native sign-in, ticketed socket, and the auth failure paths",
+      "file": "S1/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 44,
+      "wsFrames": 4,
+      "httpExchanges": 13,
+      "finished": true
+    },
+    {
+      "id": "S10",
+      "title": "drop with an open approval, reconnect, answer it",
+      "file": "S10/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 58,
+      "wsFrames": 35,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S11",
+      "title": "backend restart: epoch change, runtime ids gone, stored ids survive",
+      "file": "S11/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 53,
+      "wsFrames": 30,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S12",
+      "title": "resume a long conversation (60 turns) incl. a compression",
+      "file": "S12/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 892,
+      "wsFrames": 870,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S13",
+      "title": "slash completion, catalog, exec, a skill command, /stop",
+      "file": "S13/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 55,
+      "wsFrames": 32,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S14",
+      "title": "access token expiry while the socket is open; refresh; redial",
+      "file": "S14/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 68,
+      "wsFrames": 40,
+      "httpExchanges": 10,
+      "finished": true
+    },
+    {
+      "id": "S15",
+      "title": "model provider error",
+      "file": "S15/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 32,
+      "wsFrames": 14,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S16",
+      "title": "two clients on one session; busy-session prompt",
+      "file": "S16/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 90,
+      "wsFrames": 67,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S17",
+      "title": "commands.catalog + complete.slash with a quick command, a plugin-free skill and the bundled skills",
+      "file": "S17/v0.22.0-2026-10-14T16-31-35-446Z.jsonl",
+      "entries": 55,
+      "wsFrames": 36,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S18",
+      "title": "/bg via prompt.background → background.complete (idle session, then mid-turn)",
+      "file": "S18/v0.22.0-2026-10-14T16-31-35-446Z.jsonl",
+      "entries": 65,
+      "wsFrames": 46,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S19",
+      "title": "/btw via prompt.btw → btw.complete (with history; nothing written to the transcript)",
+      "file": "S19/v0.22.0-2026-10-14T16-31-35-446Z.jsonl",
+      "entries": 46,
+      "wsFrames": 28,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S20",
+      "title": "/compress via session.compress: too small (noop), then a real compression, then resume elsewhere",
+      "file": "S20/v0.22.0-2026-10-14T16-34-57-377Z.jsonl",
+      "entries": 499,
+      "wsFrames": 476,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S21",
+      "title": "notification.show/clear (credit headers), memory write, review.summary (/refine), subagent.start/complete (delegate_task)",
+      "file": "S21/v0.22.0-2026-10-14T16-31-35-446Z.jsonl",
+      "entries": 110,
+      "wsFrames": 88,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S22",
+      "title": "two clients: client B answers an approval; what client A sees (the r4 F4 shape)",
+      "file": "S22/v0.22.0-2026-10-14T16-36-00-192Z.jsonl",
+      "entries": 93,
+      "wsFrames": 69,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S23",
+      "title": "idle prompt.submit with queued:true vs without, same text, two fresh sessions (plan H2)",
+      "file": "S23/v0.22.0-2026-10-14T16-37-32-697Z.jsonl",
+      "entries": 91,
+      "wsFrames": 68,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S24",
+      "title": "POST /api/gateway/restart against a local gateway process; action status; /api/status until gateway_running returns",
+      "file": "S24/v0.22.0-2026-10-14T17-02-14-277Z.jsonl",
+      "entries": 47,
+      "wsFrames": 0,
+      "httpExchanges": 20,
+      "finished": true
+    },
+    {
+      "id": "S3",
+      "title": "new conversation, first prompt, plain reply, then resume elsewhere",
+      "file": "S3/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 69,
+      "wsFrames": 47,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S3b",
+      "title": "create but never prompt: is the stored id real before the first prompt?",
+      "file": "S3b/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 35,
+      "wsFrames": 13,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S4",
+      "title": "a turn with three tool calls (one failing, one slow)",
+      "file": "S4/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 66,
+      "wsFrames": 44,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S5",
+      "title": "approval: once, session, deny, and one left to time out",
+      "file": "S5/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 149,
+      "wsFrames": 115,
+      "httpExchanges": 10,
+      "finished": true
+    },
+    {
+      "id": "S6",
+      "title": "clarify (choice, multi-select, free text), sudo, secret",
+      "file": "S6/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 118,
+      "wsFrames": 99,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S7",
+      "title": "interrupt mid-stream, and interrupt with an open approval",
+      "file": "S7/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 63,
+      "wsFrames": 44,
+      "httpExchanges": 7,
+      "finished": true
+    },
+    {
+      "id": "S8",
+      "title": "drop the socket mid-turn for <20 s, reconnect, replay",
+      "file": "S8/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 83,
+      "wsFrames": 60,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "S9",
+      "title": "drop the socket mid-turn for longer than the reap grace, then resume",
+      "file": "S9/v0.22.0-2026-10-14T16-21-32-015Z.jsonl",
+      "entries": 74,
+      "wsFrames": 51,
+      "httpExchanges": 8,
+      "finished": true
+    },
+    {
+      "id": "T1",
+      "title": "lane discovery: phone seed, REST list with bearer, latest-descendant, resume, history",
+      "file": "T1/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 43,
+      "wsFrames": 11,
+      "httpExchanges": 10,
+      "finished": true
+    },
+    {
+      "id": "T2",
+      "title": "phone turns while the pane is attached: sessions.changed → session.history (plain and tool-using)",
+      "file": "T2/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 122,
+      "wsFrames": 65,
+      "httpExchanges": 9,
+      "finished": true
+    },
+    {
+      "id": "T3",
+      "title": "pane turn on the lane: prompt.submit → stream → complete → history; nothing reaches the phone",
+      "file": "T3/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 69,
+      "wsFrames": 33,
+      "httpExchanges": 9,
+      "finished": true
+    },
+    {
+      "id": "T4",
+      "title": "phone-first race: pane prompt.submit during a running phone turn (the duplicated-context negative fixture)",
+      "file": "T4/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 141,
+      "wsFrames": 84,
+      "httpExchanges": 9,
+      "finished": true
+    },
+    {
+      "id": "T5",
+      "title": "hold then send: wait for the phone turn's final assistant row in history, then submit",
+      "file": "T5/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 235,
+      "wsFrames": 144,
+      "httpExchanges": 9,
+      "finished": true
+    },
+    {
+      "id": "T6",
+      "title": "Telegram /new: old row ends session_reset, a new row takes the lane key; the old id still resumes",
+      "file": "T6/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 91,
+      "wsFrames": 35,
+      "httpExchanges": 15,
+      "finished": true
+    },
+    {
+      "id": "T7",
+      "title": "compression on the lane (compression.in_place: false): the tip moves; resume and latest-descendant follow",
+      "file": "T7/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 317,
+      "wsFrames": 169,
+      "httpExchanges": 12,
+      "finished": true
+    },
+    {
+      "id": "T7b",
+      "title": "compression on the lane with the DEFAULT compression.in_place: true (what a stock server does)",
+      "file": "T7b/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 315,
+      "wsFrames": 167,
+      "httpExchanges": 12,
+      "finished": true
+    },
+    {
+      "id": "T8",
+      "title": "DM topic lane (message_thread_id + is_topic_message) beside the plain DM lane: two session_keys",
+      "file": "T8/v0.22.0-2026-10-14T16-45-07-738Z.jsonl",
+      "entries": 58,
+      "wsFrames": 16,
+      "httpExchanges": 12,
+      "finished": true
+    }
+  ]
+}

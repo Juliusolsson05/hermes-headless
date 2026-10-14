@@ -45,6 +45,22 @@ export type LiveHermesOptions = {
   approvalTimeoutSeconds?: number
   /** Reuse a home across a restart (S11: same state.db, new process). */
   home?: string
+  /**
+   * Extra top-level config.yaml lines, appended verbatim (S17's
+   * `quick_commands`). Must not repeat a key this file already writes
+   * (model, dashboard, approvals): YAML keeps the last duplicate silently.
+   */
+  extraConfigYaml?: string[]
+  /**
+   * The `--host` to bind (default 127.0.0.1). S25 binds `localhost.`: v0.20.4
+   * engages its auth gate only when the bind host is not one of the literal
+   * strings {localhost, 127.0.0.1, ::1} (web_server.py should_require_auth;
+   * `dashboard.public_url` does not exist there yet), and the VPS that
+   * failed ran WITH the gate. `localhost.` (the fully-qualified spelling)
+   * is not in that set but still resolves to loopback only, so the real
+   * gated path runs without exposing a port beyond this machine.
+   */
+  bindHost?: string
 }
 
 export type LiveHermes = {
@@ -79,6 +95,7 @@ function writeHome(home: string, options: LiveHermesOptions): void {
     ...(options.approvalTimeoutSeconds !== undefined
       ? ['approvals:', `  timeout: ${options.approvalTimeoutSeconds}`]
       : []),
+    ...(options.extraConfigYaml ?? []),
     '',
   ].join('\n'))
   writeFileSync(join(home, '.env'), [
@@ -117,7 +134,7 @@ export async function startLiveHermes(options: LiveHermesOptions): Promise<LiveH
   if (!options.home) writeHome(home, options)
   const child: ChildProcess = spawn(
     join(runtimeRoot, 'venv', 'bin', 'python'),
-    ['-m', 'hermes_cli.main', 'serve', '--host', '127.0.0.1', '--port', '0', '--skip-build'],
+    ['-m', 'hermes_cli.main', 'serve', '--host', options.bindHost ?? '127.0.0.1', '--port', '0', '--skip-build'],
     {
       cwd: join(runtimeRoot, 'src'),
       env: {
@@ -164,7 +181,7 @@ export async function startLiveHermes(options: LiveHermesOptions): Promise<LiveH
     setTimeout(() => child.kill('SIGKILL'), 8000).unref()
   })
   const live: LiveHermes = {
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: `http://${options.bindHost ?? '127.0.0.1'}:${port}`,
     port,
     home,
     username: LIVE_USERNAME,

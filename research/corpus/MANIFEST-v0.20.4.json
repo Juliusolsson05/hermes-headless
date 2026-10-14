@@ -1,0 +1,16 @@
+{
+  "release": "v0.20.4",
+  "sourceCommit": "e624e9fde561e1add9388384012b295fde669ade",
+  "contract": null,
+  "scenarios": [
+    {
+      "id": "S25",
+      "title": "v0.20.4 handshake: ticket → upgrade → gateway.ready → client.capabilities answers -32601",
+      "file": "S25/v0.20.4-2026-10-14T16-30-55-017Z.jsonl",
+      "entries": 25,
+      "wsFrames": 5,
+      "httpExchanges": 7,
+      "finished": true
+    }
+  ]
+}

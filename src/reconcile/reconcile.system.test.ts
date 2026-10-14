@@ -408,7 +408,11 @@ describe('reconciler guards (round-1 review c2 survivors)', () => {
 // running turn went silent for the rest of the turn. Two guards.
 describe('history resets during a running turn (bundle 2026-10-14T16-26-49)', () => {
   it('does not call a narrower history window a rewrite (recorded S12 resume, its tail as the listing)', () => {
-    const entries = latestRecording('S12')
+    // Pinned to v0.21.7: there /compress was refused (4009 busy), so the
+    // resume holds the FULL 120 rows; on v0.22.0 the compression succeeds
+    // and the resume is already compacted (Stage 0 report), which is a
+    // different fixture, not a narrower window.
+    const entries = latestRecording('S12', { release: 'v0.21.7' })
     const resume = inboundFrames(entries).map((frame) => frame.result as Record<string, unknown> | undefined).filter((result) => result && typeof result.resumed === 'string').at(-1) as unknown as SessionResumeResult
     const { out, got } = collector()
     const reconciler = new ConversationReconciler(out)

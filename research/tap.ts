@@ -14,7 +14,8 @@
 
 import { appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { dirname } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /**
  * Machine paths are not credentials, but they are personal data in a public
@@ -23,7 +24,25 @@ import { dirname } from 'node:path'
  * results, so every occurrence is rewritten to a neutral path. Longest first,
  * so the temp dir (under /private/var/…) is replaced before its parent.
  */
+// The Hermes runtime root (where `hermes serve` runs from and reports as its
+// cwd). Before this rewrite the v0.21.7 corpus carried the developer's
+// worktree layout under /home/dev/… 225 times; a neutral root keeps
+// recordings from different machines and releases diffable. Resolved the
+// same way as src/testing/live-hermes/harness.ts (not imported: tap.ts must
+// not depend on src/, see the header).
+const RUNTIME_ROOT = resolve(process.env.HERMES_LIVE_RUNTIME ?? join(dirname(fileURLToPath(import.meta.url)), '..', '.cache', 'hermes-runtime'))
+
+function realOrSelf(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    return path
+  }
+}
+
 const PATH_REWRITES: Array<[string, string]> = [
+  [RUNTIME_ROOT, '/opt/hermes-runtime'],
+  [realOrSelf(RUNTIME_ROOT), '/opt/hermes-runtime'],
   // macOS: tmpdir() is /var/folders/…, but processes report the realpath
   // /private/var/folders/…; both spellings appear in Hermes' payloads.
   [realpathSync(tmpdir()), '/tmp/hh'],
@@ -47,6 +66,13 @@ export type TapEntry = {
   kind: TapKind
   /** Parsed JSON frame / HTTP exchange / note payload, already redacted. */
   frame: unknown
+  /**
+   * Which client socket a ws/ws-open/ws-close entry belongs to, when a
+   * scenario opens several and names them (S22: client A vs client B). Absent
+   * in single-client recordings and in every v0.21.7 file; two sockets on
+   * one session otherwise produce identical, indistinguishable lines.
+   */
+  peer?: string
 }
 
 /**
@@ -115,13 +141,18 @@ export function redact(value: unknown, keyHint?: string): unknown {
 export class WireTap {
   private readonly started = Date.now()
 
+  /** Epoch ms the tap opened; converts external timestamps (model requests) to tap time. */
+  get startedAt(): number {
+    return this.started
+  }
+
   constructor(private readonly path: string) {
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, '')
   }
 
-  write(dir: TapDirection | null, kind: TapKind, frame: unknown): void {
-    const entry: TapEntry = { t: Date.now() - this.started, dir, kind, frame: redact(frame) }
+  write(dir: TapDirection | null, kind: TapKind, frame: unknown, peer?: string): void {
+    const entry: TapEntry = { t: Date.now() - this.started, dir, kind, frame: redact(frame), ...(peer ? { peer } : {}) }
     appendFileSync(this.path, JSON.stringify(entry) + '\n')
   }
 

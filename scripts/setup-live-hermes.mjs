@@ -10,7 +10,14 @@
 // (`../../vendor/hermes-agent-src` when this package is the app's submodule).
 // Output: `.cache/hermes-runtime/{src,venv}` (git-ignored). Needs `uv` and a
 // Python that satisfies Hermes' requires-python (3.14 is what the lock pins
-// its core dependency markers to).
+// its core dependency markers to). Older releases differ: v0.20.4 (upstream
+// tag `v2026.8.18` — there is no `v0.20.4` tag) declares
+// `requires-python = ">=3.11,<3.14"`, so set HERMES_LIVE_PYTHON=3.13 for it
+// (Stage 0 S25, 2026-10-14).
+//
+// SOURCE_COMMIT holds only the commit (git describe finds no tag on the
+// vendored checkout or a shallow clone); research/provenance.ts pairs it with
+// the `--release` a recorder run names and refuses a known mismatch.
 
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
