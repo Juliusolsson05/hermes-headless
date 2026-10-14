@@ -88,6 +88,16 @@ export type ReconcilerOutput = {
   /** A keyed `notification.show` was withdrawn. */
   noticeCleared(key: string): void
   /**
+   * A connection operation (Hermes' manage_connections) opened, moved, or
+   * settled. Every frame carries the full snapshot, so the consumer replaces
+   * its copy; `settled: true` is the last one for that `opId`.
+   *
+   * Optional only because consumers that fold recordings without a client
+   * (the app's projection tests, reconcile tests) have no card to draw;
+   * HermesHeadless always wires it.
+   */
+  connection?(operation: HermesConnectionOperation): void
+  /**
    * The answer to `/bg` or `/btw`. NOT a turn: `/btw` is answered "from a
    * snapshot … history, alternation and prompt cache stay untouched"
    * (methods_prompt.py), and `/bg` runs in its own session. The consumer
@@ -107,6 +117,48 @@ export type ReconcilerOutput = {
 export type ToolResultCache = {
   get(toolCallId: string): { content: string; isError: boolean } | undefined
   set(toolCallId: string, result: { content: string; isError: boolean }): void
+}
+
+/**
+ * One connection operation, as Hermes' own card draws it
+ * (tools/connectors/operation.py Target.snapshot / request_payload; recorded
+ * S26 form-less catalog install, S27 OAuth catalog install, v0.22.0).
+ *
+ * WHY a structured operation and not a notice: the turn WAITS on it (up to
+ * `timeout_seconds`, 300 s in v0.22.0) and only a client answer, the
+ * deadline, or an interrupt ends the wait. A sentence saying "go to the
+ * dashboard" left the owner's turn stuck with no way to act from the pane
+ * (2026-10-14: "what is Hermes on about, I thought I was authenticated?").
+ */
+export type HermesConnectionOperation = {
+  opId: string
+  seq: number
+  /** Epoch ms; the turn stops waiting then. */
+  deadlineAt: number | null
+  settled: boolean
+  settledBy: string | null
+  /** The tool call this operation belongs to, when Hermes says (request frame only). */
+  toolCallId: string | null
+  targets: HermesConnectionTarget[]
+}
+
+export type HermesConnectionTarget = {
+  name: string
+  /** `connector` (a hosted account), `mcp`, `plugin`, `skill`. */
+  kind: string
+  /** `connect`, `reconnect`, `authorize`, `install`, `enable`. */
+  action: string
+  /** `pending`, `initiated`, `connected`, `skipped`, `failed`, `expired`, `not_connected`. */
+  state: string
+  resolved: boolean
+  detail: string | null
+  /** Setup text written for the user (the card's body). */
+  instructions: string | null
+  /** The browser sign-in link a hosted connector minted; absent for catalog installs. */
+  connectUrl: string | null
+  /** Credentials an install still needs; values go back with an approval. */
+  requiredEnv: Array<{ name: string; prompt: string | null; required: boolean; secret: boolean; default: string }>
+  alias: string | null
 }
 
 export type HermesNotice = {
@@ -444,15 +496,11 @@ export class ConversationReconciler {
         return
       }
       case 'connection.request':
-        // The connector card is a Hermes Desktop / dashboard surface. Without
-        // saying so the turn simply looked hung until its deadline.
-        this.out.notice({
-          key: null,
-          level: 'warn',
-          kind: 'connection',
-          text: 'Hermes is waiting for you to connect an account. Finish it in Hermes Desktop or the Hermes dashboard; the turn continues once it is connected.',
-        })
+      case 'connection.update': {
+        const operation = connectionOperation(payload)
+        if (operation) this.out.connection?.(operation)
         return
+      }
       case 'background.complete':
       case 'btw.complete': {
         const done = payload as { task_id?: string; text?: string; question?: string | null }
@@ -832,5 +880,49 @@ export class ConversationReconciler {
 
   private closeAllRequests(reason: string): void {
     for (const id of [...this.openRequests]) this.closeRequest(id, reason)
+  }
+}
+
+/** A `connection.request` / `connection.update` payload as a HermesConnectionOperation; null when malformed. */
+export function connectionOperation(payload: unknown): HermesConnectionOperation | null {
+  if (!payload || typeof payload !== 'object') return null
+  const raw = payload as Record<string, unknown>
+  if (typeof raw.op_id !== 'string' || !Array.isArray(raw.targets)) return null
+  const str = (value: unknown) => (typeof value === 'string' && value.length > 0 ? value : null)
+  const targets: HermesConnectionTarget[] = []
+  for (const entry of raw.targets) {
+    if (!entry || typeof entry !== 'object') continue
+    const target = entry as Record<string, unknown>
+    if (typeof target.name !== 'string') continue
+    targets.push({
+      name: target.name,
+      kind: String(target.kind ?? ''),
+      action: String(target.action ?? ''),
+      state: String(target.state ?? 'pending'),
+      resolved: target.resolved === true,
+      detail: str(target.detail),
+      instructions: str(target.instructions),
+      connectUrl: str(target.connect_url),
+      requiredEnv: Array.isArray(target.required_env)
+        ? target.required_env.flatMap((field) => {
+          if (!field || typeof field !== 'object' || typeof (field as { name?: unknown }).name !== 'string') return []
+          const spec = field as Record<string, unknown>
+          return [{ name: String(spec.name), prompt: str(spec.prompt), required: spec.required !== false, secret: spec.secret === true, default: typeof spec.default === 'string' ? spec.default : '' }]
+        })
+        : [],
+      alias: str(target.alias),
+    })
+  }
+  const deadline = typeof raw.deadline_at === 'number' ? Math.round(raw.deadline_at * 1000) : null
+  return {
+    opId: raw.op_id,
+    seq: typeof raw.seq === 'number' ? raw.seq : 0,
+    deadlineAt: deadline,
+    // The request frame has no settled fields; an update says `settled` and
+    // `settled_at` (recorded S26/S27).
+    settled: raw.settled === true || (typeof raw.settled_at === 'number'),
+    settledBy: str(raw.settled_by),
+    toolCallId: str(raw.tool_call_id),
+    targets,
   }
 }

@@ -723,6 +723,39 @@ const scenarios: Scenario[] = [
       await Promise.race([peer.closed, sleep(2000)])
     },
   },
+  {
+    id: 'S26',
+    title: 'connection.request (form): manage_connections installs a catalog MCP that needs a credential; the card is skipped',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      await prompt(peer, sid, '[[hh:connect-form]] Connect n8n.')
+      const request = await peer.waitFor((frame) => eventType(frame) === 'connection.request', 60_000)
+      const payload = (request.params as { payload: { op_id: string; targets: Array<{ name: string }> } }).payload
+      ctx.tap.note('connection.request targets', { names: payload.targets.map((target) => target.name) })
+      // Skip, as the card's Esc does: the turn must resume with the tool's answer.
+      await peer.call('connection.respond', { op_id: payload.op_id, owner: { session_id: sid, type: 'session' }, result: { targets: payload.targets.map((target) => ({ name: target.name, status: 'skipped' })) } })
+      await turnComplete(peer, sid)
+      peer.close()
+    },
+  },
+  {
+    id: 'S27',
+    title: 'connection.request (oauth): a catalog MCP whose install is a browser authorization; the card is skipped',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      await prompt(peer, sid, '[[hh:connect-oauth]] Connect Airtable.')
+      const request = await peer.waitFor((frame) => eventType(frame) === 'connection.request', 60_000)
+      const payload = (request.params as { payload: { op_id: string; targets: Array<{ name: string }> } }).payload
+      ctx.tap.note('connection.request targets', { names: payload.targets.map((target) => target.name) })
+      // Hold the card a moment so any watcher transitions (connection.update) are recorded.
+      await sleep(3000)
+      await peer.call('connection.respond', { op_id: payload.op_id, owner: { session_id: sid, type: 'session' }, result: { targets: payload.targets.map((target) => ({ name: target.name, status: 'skipped' })) } })
+      await turnComplete(peer, sid)
+      peer.close()
+    },
+  },
 ]
 
 // `--release <tag>` names the Hermes release under HERMES_LIVE_RUNTIME (default

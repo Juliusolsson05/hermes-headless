@@ -45,9 +45,12 @@ export const HANDLED_EVENTS = [
   'subagent.complete',
   //  - a safety signal on tool output (prompt-injection / secret findings).
   'tool.output_risk',
-  //  - a connector the turn waits on; Agent Code cannot show the card, but
-  //    it must say where to act, or the turn looks hung.
+  //  - a connection operation the turn waits on (manage_connections): the
+  //    request opens the card, every update carries the full snapshot, the
+  //    last one settles it (recorded S26/S27). The client answers through
+  //    `connection.respond` (HermesHeadless.respondConnection).
   'connection.request',
+  'connection.update',
   //  - the ANSWERS to /bg and /btw. Lost entirely before (r4 F6).
   'background.complete',
   'btw.complete',
@@ -104,7 +107,6 @@ export const IGNORED_EVENTS: Readonly<Record<string, string>> = {
   'subagent.progress': 'subagent roster',
   'subagent.thinking': 'subagent roster',
   'subagent.tool': 'subagent roster',
-  'connection.update': 'connector operation cards (the request itself becomes a notice)',
   'display.status': 'remote display',
   'display.lease': 'remote display',
   'display.install.log': 'remote display',

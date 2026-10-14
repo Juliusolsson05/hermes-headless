@@ -113,6 +113,19 @@ export const SCENARIOS: Record<string, Step[]> = {
   // S21 subagent.start / subagent.complete: the child's first user message is
   // the goal (tools/delegate_tool_child_run.py), so its marker selects
   // `say-child` and the child answers "ANSWER child".
+  // S26/S27 connection.request: Hermes' manage_connections tool opens a
+  // connection operation (tools/connectors) whose card a client must draw.
+  // Bundled catalog entries, so nothing leaves the machine: n8n-official asks
+  // for a credential (the card's form), airtable is OAuth (the card's browser
+  // leg). The turn waits on the card until it is answered or times out.
+  'connect-form': [
+    { kind: 'tools', calls: [{ name: 'manage_connections', arguments: { action: 'install', connectors: [{ name: 'n8n-official', mcp: true }] } }] },
+    { kind: 'text', chunks: ['Connection', ' step done.'], delayMs: 30 },
+  ],
+  'connect-oauth': [
+    { kind: 'tools', calls: [{ name: 'manage_connections', arguments: { action: 'install', connectors: [{ name: 'airtable', mcp: true }] } }] },
+    { kind: 'text', chunks: ['Connection', ' step done.'], delayMs: 30 },
+  ],
   delegate: [
     { kind: 'tools', calls: [{ name: 'delegate_task', arguments: { tasks: [{ goal: '[[hh:say-child]] Say hi from the child.', context: 'none' }] } }] },
     { kind: 'text', chunks: ['Dispatched.'], delayMs: 30 },
