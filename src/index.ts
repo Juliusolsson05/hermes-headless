@@ -15,7 +15,7 @@ export type {
   SlashOutcome,
 } from './HermesHeadless.js'
 export { RpcConnection, RpcError, RpcTimeoutError, ConnectionClosedError } from './transport/RpcConnection.js'
-export type { ReplayOutcome, ServerRequest, WebSocketLike } from './transport/RpcConnection.js'
+export type { ServerRequest, WebSocketLike } from './transport/RpcConnection.js'
 export { ConversationReconciler, HERMES_SEMANTIC_SOURCE } from './reconcile/ConversationReconciler.js'
 export type { CommittedRow, SemanticEvent } from './reconcile/ConversationReconciler.js'
 export { CommittedChannel, ScreenChannel, SemanticChannel } from './channels/index.js'

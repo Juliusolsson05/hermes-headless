@@ -396,3 +396,189 @@ describe('commands (package review B #2 survivors)', () => {
     expect(h.headless.storedSessionId).toBe(next.stored_session_id)
   })
 })
+
+// Round-1 review c2 (2026-10-13): probes of findings 1-3 made permanent, and
+// tests for the surviving mutants that guard real behaviour.
+describe('round-1 review c2', () => {
+  function s10() {
+    const frames = inboundFrames(latestRecording('S10'))
+    const approval = frames.find((frame) => frame.method === 'approval')!
+    const sid = String((approval.params as { session_id: string }).session_id)
+    const created = firstResult(frames, (result) => result.session_id === sid && result.message_count === 0)
+    return { approval, sid, created, open: [{ id: approval.id, method: 'approval', params: approval.params }] }
+  }
+
+  it('#1 keeps an approval that arrives while a resume is attaching (no close, no flicker)', async () => {
+    const { approval, created, open } = s10()
+    const h = harness({ mode: 'resume', storedSessionId: String(created.stored_session_id) })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    // Hermes routes the running turn's approval here the moment the resume rebinds.
+    socket.push(approval)
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { ...created, running: true } })
+    await socket.answerCall('session.events.since', ring([], { latest_seq: 5, open_requests: open }))
+    await starting
+    expect(h.requests.map((request) => request.id)).toEqual([approval.id])
+    expect(h.closed).toEqual([])
+  })
+
+  it('#1 keeps an open approval across a truncated reconnect (activate, then resume on the same socket)', async () => {
+    const { approval, sid, created, open } = s10()
+    const h = harness({ mode: 'create', source: 'agent-code' })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    await socket.answerCall('session.create', created)
+    await socket.answerCall('session.events.since', ring([]))
+    await starting
+    socket.push(eventFrame({ type: 'message.start', session_id: sid, seq: 1 }))
+    socket.push(approval)
+    socket.close(4000, 'drop')
+    const reconnecting = h.headless.reconnect()
+    const second = await h.nextSocket()
+    await handshake(second)
+    await second.answerCall('session.activate', created)
+    await second.answerCall('session.events.since', ring([], { truncated: true, latest_seq: 900, open_requests: open }))
+    await second.answerCall('session.resume', { ...created, running: true })
+    await second.answerCall('session.events.since', ring([], { latest_seq: 900, open_requests: open }))
+    await second.answerCall('session.history', { count: 0, messages: [] })
+    await reconnecting
+    // Closed as superseded by the resume snapshot, reopened from the ring:
+    // opened once more than it was closed, so it is open at the end.
+    const opened = h.requests.filter((request) => request.id === approval.id).length
+    const closed = h.closed.filter((id) => id === approval.id).length
+    expect(opened - closed).toBe(1)
+  })
+
+  it('#1 / M36: a card still open across an activate reconnect is not shown twice', async () => {
+    const { approval, sid, created, open } = s10()
+    const h = harness({ mode: 'create', source: 'agent-code' })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    await socket.answerCall('session.create', created)
+    await socket.answerCall('session.events.since', ring([]))
+    await starting
+    socket.push(eventFrame({ type: 'message.start', session_id: sid, seq: 1 }))
+    socket.push(approval)
+    socket.close(4000, 'drop')
+    const reconnecting = h.headless.reconnect()
+    const second = await h.nextSocket()
+    await handshake(second)
+    await second.answerCall('session.activate', created)
+    await second.answerCall('session.events.since', ring([], { latest_seq: 1, open_requests: open }))
+    await second.answerCall('session.history', { count: 0, messages: [] })
+    await reconnecting
+    expect(h.requests.map((request) => request.id)).toEqual([approval.id])
+  })
+
+  it('#2 replacing its own socket is not reported as a disconnect', async () => {
+    const { h, socket } = await started()
+    const states: string[] = []
+    h.headless.on('connection', (state: { kind: string }) => states.push(state.kind))
+    const reconnecting = h.headless.reconnect()
+    const second = await h.nextSocket()
+    expect(socket.readyState).toBe(3)
+    await handshake(second)
+    await second.answerCall('session.activate', firstResult(sessionEvents('S3').frames, (result) => result.message_count === 0))
+    await second.answerCall('session.events.since', ring([]))
+    await second.answerCall('session.history', { count: 0, messages: [] })
+    await reconnecting
+    expect(states).toEqual(['connecting', 'ready'])
+  })
+
+  it('#3 settles a long turn whose start was evicted but which completed before the ring read (recorded S9)', async () => {
+    const frames = inboundFrames(latestRecording('S9'))
+    const running = firstResult(frames, (result) => result.running === true)
+    const sid = String(running.session_id)
+    const events = frames.filter((frame) => frame.method === 'event' && (frame.params as { session_id?: string }).session_id === sid).map((frame) => frame.params as Record<string, unknown>)
+    const complete = events.find((event) => event.type === 'message.complete')!
+    const lastDelta = events.filter((event) => event.type === 'message.delta').at(-1)!
+    const h = harness({ mode: 'resume', storedSessionId: String(running.stored_session_id) })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    await socket.answerCall('session.resume', running)
+    // Mechanical mutation of S9: the ring lost the turn's start (> 512 events).
+    await socket.answerCall('session.events.since', ring([lastDelta, complete], { truncated: true, latest_seq: complete.seq }))
+    await starting
+    expect(h.headless.turnInFlight).toBe(false)
+    expect(h.semantic.some((event) => event.type === 'turn_completed')).toBe(true)
+  })
+
+  it('M27: declining sends each request\'s documented "no", never an approval', async () => {
+    const { h, socket } = await started()
+    const approval = inboundFrames(latestRecording('S5')).find((frame) => frame.method === 'approval')!
+    socket.push(approval)
+    await h.headless.declineRequest({ id: String(approval.id), method: 'approval' })
+    expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: approval.id, result: { choice: 'deny' } })
+    for (const [method, result] of [['clarify', {}], ['sudo', { value: '' }], ['secret', { value: '' }]] as const) {
+      const frame = inboundFrames(latestRecording('S6')).find((entry) => entry.method === method)!
+      socket.push(frame)
+      await h.headless.declineRequest({ id: String(frame.id), method })
+      expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: frame.id, result })
+    }
+  })
+
+  it('M30: a TRANSIENT resume error fails the start; it never abandons the conversation for a new one', async () => {
+    const h = harness({ mode: 'resume', storedSessionId: 'my-conversation' })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push({ jsonrpc: '2.0', id: resume.id, error: { code: 5036, message: 'database unavailable' } })
+    await expect(starting).rejects.toThrow(/database unavailable/)
+    expect(socket.sent.some((frame) => frame.method === 'session.create')).toBe(false)
+  })
+
+  it('M24: stop() during the handshake leaves no live connection', async () => {
+    const h = harness({ mode: 'create', source: 'agent-code' })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    socket.push(READY_FRAME())
+    await h.headless.stop()
+    await socket.answerCall('client.capabilities', CAPS).catch(() => undefined)
+    await expect(starting).rejects.toThrow()
+    expect(socket.readyState).toBe(3)
+    expect(h.headless.isConnected).toBe(false)
+  })
+
+  it('M18/M19: a steered or refused prompt does not leave a phantom turn in flight', async () => {
+    const { h, socket } = await started()
+    const steering = h.headless.prompt('fold this in')
+    await socket.answerCall('prompt.submit', { status: 'steered' })
+    await steering
+    expect(h.headless.turnInFlight).toBe(false)
+    const refusing = h.headless.prompt('not now')
+    const submit = await socket.nextSent((frame) => frame.method === 'prompt.submit' && (frame.params as { text?: string }).text === 'not now')
+    socket.push({ jsonrpc: '2.0', id: submit.id, error: { code: 4009, message: 'busy' } })
+    await expect(refusing).rejects.toThrow()
+    expect(h.headless.turnInFlight).toBe(false)
+  })
+
+  it('M20 / M29: a resumed running turn is in flight; an activate reconnect fetches the history it missed', async () => {
+    const frames = inboundFrames(latestRecording('S9'))
+    const running = firstResult(frames, (result) => result.running === true)
+    const h = harness({ mode: 'resume', storedSessionId: String(running.stored_session_id) })
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    await socket.answerCall('session.resume', running)
+    await socket.answerCall('session.events.since', ring([], { latest_seq: 0 }))
+    await starting
+    expect(h.headless.turnInFlight).toBe(true)
+    await socket.answerCall('session.history', { count: 0, messages: [] })
+    socket.close(4000, 'drop')
+    const reconnecting = h.headless.reconnect()
+    const second = await h.nextSocket()
+    await handshake(second)
+    await second.answerCall('session.activate', running)
+    await second.answerCall('session.events.since', ring([]))
+    const history = await second.nextSent((frame) => frame.method === 'session.history')
+    second.push({ jsonrpc: '2.0', id: history.id, result: { count: 0, messages: [] } })
+    await reconnecting
+  })
+})
+

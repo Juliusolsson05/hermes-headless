@@ -164,10 +164,11 @@ export class HermesHeadless extends EventEmitter {
    * Connect and bind the conversation. Resolves once the snapshot is applied
    * (history committed, any in-flight turn and open request restored).
    *
-   * A resume of a stored id the backend does not know (deleted, or never
-   * prompted and since reaped: S3b showed an unprompted session has no row)
+   * A resume of a stored id the backend does not know (4007: deleted from
+   * another client; Hermes materialises minted-but-unprompted ids itself,
+   * methods_session.py _resume_materialize_minted, so that is not a cause)
    * falls back to a NEW conversation and says so with `session-replaced`,
-   * instead of leaving the pane dead.
+   * instead of leaving the pane dead. reattach() does the same on reconnect.
    */
   async start(): Promise<void> {
     const connection = await this.connect()
@@ -286,7 +287,13 @@ export class HermesHeadless extends EventEmitter {
         this.watermarks.clear()
         this.reconciler.applySnapshot(resumed, 'snapshot', { seedInflight: turnStart === null })
         this.pendingTurns = resumed.running ? 1 : 0
-        return { fromSeq: turnStart }
+        // A long turn (> the 512-event ring) whose start was evicted, but which
+        // completed between the rebind and the ring read: the snapshot seeded
+        // it as running and nothing would ever settle it, so dispatch the
+        // ring from its `message.complete` (round-1 review c2 #3). Deltas in
+        // that window are not replayed; the history fetch commits the answer.
+        const fromSeq = turnStart ?? (resumed.running ? lastTurnEnd(ring.events, resumed.session_id) : null)
+        return { fromSeq }
       },
     )
     this.scheduleHistoryFetch()
@@ -454,7 +461,13 @@ export class HermesHeadless extends EventEmitter {
     if (this.stopped) throw new Error('HermesHeadless was stopped')
     const generation = ++this.connectGeneration
     this.emit('connection', { kind: 'connecting' } satisfies HermesConnectionState)
-    this.connection?.close(1000, 'replaced')
+    // Detach BEFORE closing: replacing our own socket is not a disconnect.
+    // Its close listener saw `this.connection === connection` and reported
+    // one, the consumer scheduled another reconnect, and that one replaced
+    // the healthy socket again, forever (round-1 review c2 #2: 153 dials in 3 s).
+    const previous = this.connection
+    this.connection = null
+    previous?.close(1000, 'replaced')
     const socket = await this.options.dial()
     if (generation !== this.connectGeneration) {
       socket.close(1000, 'superseded')
@@ -515,6 +528,19 @@ export class HermesHeadless extends EventEmitter {
  * `message.complete` after it: the turn running right now. Null when no turn
  * is open in the ring (idle, or its start was evicted).
  */
+/** Seq of the ring's last `message.complete` with no `message.start` after it. */
+function lastTurnEnd(events: Array<Record<string, unknown>>, sessionId: string): number | null {
+  let end: number | null = null
+  const ordered = events
+    .filter((event) => event.session_id === sessionId && typeof event.seq === 'number')
+    .sort((a, b) => (a.seq as number) - (b.seq as number))
+  for (const event of ordered) {
+    if (event.type === 'message.complete') end = event.seq as number
+    if (event.type === 'message.start') end = null
+  }
+  return end
+}
+
 function openTurnStart(events: Array<Record<string, unknown>>, sessionId: string): number | null {
   let start: number | null = null
   const ordered = events

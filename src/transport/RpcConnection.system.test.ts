@@ -63,11 +63,15 @@ describe('replay across a dropped socket (recorded S8)', () => {
   })
 
   it('delivers every event exactly once in seq order for every cut point, gap and race', async () => {
-    // Model of the real race: when the client reconnects, the server's ring
-    // holds the gap (cut .. cut+gapLength); the turn keeps streaming, so
-    // frames NEWER than the gap can arrive on the new socket before the
-    // replay reply does. Those are the dangerous ones: dispatched first, they
-    // would move the watermark past the whole gap.
+    // Model of the real race, through acquire() (the path HermesHeadless
+    // reconnects with; round-1 review c2 #4: this sweep used to exercise a
+    // replay() production never called). Hermes routes the session's events
+    // to the new socket from the moment `session.activate` rebinds it, so
+    // frames NEWER than the ring's gap can arrive before the activate reply
+    // AND between it and the ring reply. Dispatched first, they would move
+    // the watermark past the whole gap. (A backend restart, recorded S11, is
+    // handled above this layer: HermesHeadless.reconnect compares epochs and
+    // goes straight to session.resume; pinned in HermesHeadless.system.test.)
     const { sid, events } = s8TurnEvents()
     for (let cut = 0; cut < events.length; cut += 1) {
       for (const gapLength of [0, 1, 4]) {
@@ -81,15 +85,24 @@ describe('replay across a dropped socket (recorded S8)', () => {
           first.socket.close(4000, 'drop')
 
           const second = await openConnection(watermarks)
-          const replaying = second.connection.replay(sid, 'epoch-1')
+          const lastSeen = watermarks.get(sid) ?? 0
+          const acquiring = second.connection.acquire(
+            () => second.connection.call<{ session_id: string }>('session.activate', { session_id: sid }),
+            () => ({ fromSeq: lastSeen + 1 }),
+            lastSeen,
+          )
+          const activate = await second.socket.nextSent((frame) => frame.method === 'session.activate')
+          const half = Math.ceil(newer.length / 2)
+          for (const event of newer.slice(0, half)) second.socket.push(eventFrame(event))
+          second.socket.push({ jsonrpc: '2.0', id: activate.id, result: { session_id: sid } })
           const call = await second.socket.nextSent((frame) => frame.method === 'session.events.since')
-          for (const event of newer) second.socket.push(eventFrame(event))
+          for (const event of newer.slice(half)) second.socket.push(eventFrame(event))
           second.socket.push({
             jsonrpc: '2.0',
             id: call.id,
-            result: { events: gap, latest_seq: gap.at(-1)?.seq ?? 0, truncated: false, count: gap.length, epoch: 'epoch-1', open_requests: [] },
+            result: { events: gap, latest_seq: gap.at(-1)?.seq ?? lastSeen, truncated: false, count: gap.length, epoch: 'epoch-1', open_requests: [] },
           })
-          await replaying
+          await acquiring
           for (const event of rest) second.socket.push(eventFrame(event))
           const delivered = [...first.events, ...second.events].map((event) => event.seq)
           expect({ cut, gapLength, race, delivered }).toEqual({ cut, gapLength, race, delivered: events.map((event) => event.seq) })
@@ -98,50 +111,63 @@ describe('replay across a dropped socket (recorded S8)', () => {
     }
   })
 
-  it('without the replay hold, a racing live frame would win and the gap would be lost (guards the hold)', async () => {
-    // Direct check of the property the hold protects: a live frame newer than
-    // the gap, dispatched first, would move the watermark past the gap.
+  it('parks a racing live frame until the ring lands (guards the acquisition hold)', async () => {
     const { sid, events } = s8TurnEvents()
-    const watermarks = new Map<string, number>([[sid, events[5].seq as number]])
+    const lastSeen = events[5].seq as number
+    const watermarks = new Map<string, number>([[sid, lastSeen]])
     const second = await openConnection(watermarks)
-    const replaying = second.connection.replay(sid, 'epoch-1')
+    const acquiring = second.connection.acquire(
+      () => second.connection.call<{ session_id: string }>('session.activate', { session_id: sid }),
+      () => ({ fromSeq: lastSeen + 1 }),
+      lastSeen,
+    )
+    await second.socket.answerCall('session.activate', { session_id: sid })
     const call = await second.socket.nextSent((frame) => frame.method === 'session.events.since')
     second.socket.push(eventFrame(events[10]))
     expect(second.events).toEqual([])
     second.socket.push({ jsonrpc: '2.0', id: call.id, result: { events: events.slice(6, 11), latest_seq: events[10].seq, truncated: false, count: 5, epoch: 'epoch-1', open_requests: [] } })
-    await replaying
+    await acquiring
     expect(second.events.map((event) => event.seq)).toEqual(events.slice(6, 11).map((event) => event.seq))
   })
 })
 
-describe('backend restart (recorded S11)', () => {
-  it('reports epoch-changed instead of "nothing missed" when the backend process changed', async () => {
-    const entries = latestRecording('S11')
-    const since = inboundFrames(entries).find((frame) => {
-      const result = frame.result as { epoch?: string; events?: unknown[] } | undefined
-      return result?.epoch !== undefined && Array.isArray(result?.events)
-    })!.result as Record<string, unknown>
-    expect(since.events).toEqual([])
-    const watermarks = new Map([['7a2de5b8', 13]])
-    const { socket, connection } = await openConnection(watermarks, String(since.epoch))
-    const outcome = connection.replay('7a2de5b8', 'epoch-of-the-old-process')
-    await socket.answerCall('session.events.since', since)
-    expect(await outcome).toEqual({ kind: 'epoch-changed', epoch: since.epoch })
-    expect(watermarks.has('7a2de5b8')).toBe(false)
-  })
-})
-
 describe('server requests', () => {
-  it('re-delivers the open approval from the recorded S10 replay and answers it through request.answer', async () => {
+  it('a snapshot-only attach moves the watermark to the ring head, so parked events it covers do not dispatch twice', async () => {
+    // Package review c2 survivor M03. A resume snapshot already contains
+    // everything up to the ring head; an event parked during the attach with
+    // a seq at or below it must not be dispatched on top of the snapshot.
+    const { sid, events } = s8TurnEvents()
+    const watermarks = new Map<string, number>()
+    const { socket, connection, events: delivered } = await openConnection(watermarks)
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
+      () => ({ fromSeq: null }),
+    )
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push(eventFrame(events[3]))
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    await socket.answerCall('session.events.since', { events: [], latest_seq: events[4].seq, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [] })
+    await acquiring
+    expect(delivered).toEqual([])
+    socket.push(eventFrame(events[5]))
+    expect(delivered.map((event) => event.seq)).toEqual([events[5].seq])
+  })
+
+  it('re-delivers the open approval from the recorded S10 ring and answers it through request.answer', async () => {
     const entries = latestRecording('S10')
     const since = inboundFrames(entries).find((frame) => Array.isArray((frame.result as { open_requests?: unknown[] } | undefined)?.open_requests))!.result as Record<string, unknown>
     const open = since.open_requests as Array<{ id: string; method: string }>
     expect(open.map((request) => request.method)).toEqual(['approval'])
     const sid = String((open[0] as { params?: { session_id?: string } }).params?.session_id ?? 'x')
     const { socket, connection, requests } = await openConnection(new Map([[sid, 8]]))
-    const outcome = connection.replay(sid, 'epoch-1')
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.activate', { session_id: sid }),
+      () => ({ fromSeq: 9 }),
+      8,
+    )
+    await socket.answerCall('session.activate', { session_id: sid })
     await socket.answerCall('session.events.since', { ...since, epoch: 'epoch-1' })
-    await outcome
+    await acquiring
     expect(requests).toHaveLength(1)
     expect(requests[0]).toMatchObject({ id: open[0].id, method: 'approval', replayed: true })
     const answering = connection.answer(open[0].id, { choice: 'once' })
@@ -169,13 +195,43 @@ describe('server requests', () => {
     expect(socket.sent.at(-1)).toMatchObject({ id: 'srq-000000000001', error: { code: -32601 } })
   })
 
-  it('surfaces a request only once even when the live frame and open_requests both carry it', async () => {
-    const entries = latestRecording('S5')
-    const live = inboundFrames(entries).find((frame) => frame.method === 'approval')!
+  // Round-1 review c2 #1: a live request frame that arrives WHILE a resume is
+  // attaching is held, and the ring (read after it) decides whether it is
+  // still open; one that reached this socket live stays live, so its answer
+  // is a response frame.
+  it('holds a live request during an attach and surfaces it once, live, when the ring still lists it', async () => {
+    const live = inboundFrames(latestRecording('S5')).find((frame) => frame.method === 'approval')!
+    const sid = String((live.params as { session_id: string }).session_id)
     const { socket, connection, requests } = await openConnection(new Map())
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
+      () => ({ fromSeq: null }),
+    )
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
     socket.push(live)
-    connection.surfaceOpenRequests([{ id: String(live.id), method: 'approval', params: live.params as Record<string, unknown> }])
-    expect(requests).toHaveLength(1)
+    expect(requests).toEqual([])
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    await socket.answerCall('session.events.since', { events: [], latest_seq: 0, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [{ id: live.id, method: 'approval', params: live.params }] })
+    await acquiring
+    expect(requests).toEqual([expect.objectContaining({ id: live.id, replayed: false })])
+    await connection.answer(String(live.id), { choice: 'deny' })
+    expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: live.id, result: { choice: 'deny' } })
+  })
+
+  it('drops a held request the ring no longer lists (answered or cancelled while attaching)', async () => {
+    const live = inboundFrames(latestRecording('S5')).find((frame) => frame.method === 'approval')!
+    const sid = String((live.params as { session_id: string }).session_id)
+    const { socket, connection, requests } = await openConnection(new Map())
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
+      () => ({ fromSeq: null }),
+    )
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push(live)
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    await socket.answerCall('session.events.since', { events: [], latest_seq: 0, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [] })
+    await acquiring
+    expect(requests).toEqual([])
   })
 })
 

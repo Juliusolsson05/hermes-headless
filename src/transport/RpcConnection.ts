@@ -24,7 +24,7 @@
 import { EventEmitter } from 'node:events'
 
 import { classifyFrame, envelopeFromReplay } from '../contract/frames.js'
-import type { EventEnvelope, GatewayReadyPayload, OpenRequestEntry, RpcErrorBody, SessionEventsSinceResult } from '../contract/wire.js'
+import type { EventEnvelope, GatewayReadyPayload, RpcErrorBody, SessionEventsSinceResult } from '../contract/wire.js'
 
 /** The subset of the WHATWG WebSocket this class needs; Node 22+ and Electron provide it. */
 export type WebSocketLike = {
@@ -91,13 +91,6 @@ type Pending = {
   timer: unknown
 }
 
-export type ReplayOutcome =
-  /** Missing events were dispatched in order; live delivery continues. */
-  | { kind: 'replayed'; dispatched: number; openRequests: OpenRequestEntry[] }
-  /** The ring no longer holds the gap (512 events / 4 MiB per session): re-snapshot. */
-  | { kind: 'truncated'; openRequests: OpenRequestEntry[] }
-  /** A different backend process: runtime ids and seqs are void, re-snapshot by stored id. */
-  | { kind: 'epoch-changed'; epoch: string }
 
 // Hermes' own client defaults (apps/shared/src/json-rpc-gateway.ts,
 // json-rpc-channel.ts): 120 s per request, 15 s heartbeat, 45 s deadline.
@@ -110,10 +103,16 @@ const OPEN = 1
 export class RpcConnection extends EventEmitter {
   private nextId = 1
   private readonly pending = new Map<string, Pending>()
-  /** Sessions whose replay fetch is in flight; their live seq'd events wait here. */
-  private readonly held = new Map<string, EventEnvelope[]>()
   /** Seq'd events parked while a conversation is being attached (see acquire). */
   private acquiring: EventEnvelope[] | null = null
+  /**
+   * Live server→client request frames that arrived during an acquire. Held
+   * like events, because a resume snapshot closes every card as superseded:
+   * surfacing one before the snapshot opened a card the snapshot then closed.
+   * The ring read is AFTER all of them, so its `open_requests` decides which
+   * are still open (round-1 review c2 #1).
+   */
+  private acquiringRequests: Array<{ id: string; method: string; params: Record<string, unknown> }> = []
   /** Requests already surfaced on THIS connection, so a replayed copy is not delivered twice. */
   private readonly surfacedRequests = new Set<string>()
   /** Requests surfaced from `open_requests` (no live frame on this socket); see answer(). */
@@ -234,55 +233,6 @@ export class RpcConnection extends EventEmitter {
   }
 
   /**
-   * Fetch the events this client missed for `sessionId` and dispatch exactly
-   * the gap, in order, with no duplicates against frames arriving live.
-   *
-   * WHY the hold: the replay response and live frames race on the same
-   * socket. Without parking live seq'd frames for this session until the
-   * replay lands, a live frame either dispatches twice (once live, once in the
-   * replay) or advances the watermark past the gap so the replay's older
-   * events are dropped as duplicates (Hermes Desktop hit both,
-   * json-rpc-gateway.ts replayHold comment).
-   */
-  async replay(sessionId: string, expectedEpoch: string | null): Promise<ReplayOutcome> {
-    const lastSeen = this.options.watermarks.get(sessionId) ?? 0
-    this.held.set(sessionId, [])
-    let result: SessionEventsSinceResult
-    try {
-      result = await this.call<SessionEventsSinceResult>('session.events.since', { session_id: sessionId, last_seen: lastSeen }, 10_000)
-    } catch (error) {
-      this.releaseHold(sessionId)
-      throw error
-    }
-    const openRequests = Array.isArray(result.open_requests) ? result.open_requests : []
-    // Recorded in S11: after a backend restart the reply is `[]` with a new
-    // epoch. Treating that as "nothing missed" would silently lose the turn.
-    if (expectedEpoch && result.epoch && result.epoch !== expectedEpoch) {
-      this.options.watermarks.delete(sessionId)
-      this.held.delete(sessionId)
-      return { kind: 'epoch-changed', epoch: result.epoch }
-    }
-    if (result.truncated) {
-      // The gap is gone from the ring. Move the watermark to the head so live
-      // delivery resumes, and tell the owner to re-snapshot (session.resume).
-      this.options.watermarks.set(sessionId, Math.max(lastSeen, result.latest_seq))
-      this.releaseHold(sessionId)
-      return { kind: 'truncated', openRequests }
-    }
-    let dispatched = 0
-    const events = result.events
-      .map(envelopeFromReplay)
-      .filter((event): event is EventEnvelope => event !== null)
-      .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
-    for (const event of events) {
-      if (this.dispatchSequenced(event, true)) dispatched += 1
-    }
-    this.releaseHold(sessionId)
-    for (const request of openRequests) this.surfaceRequest(request.id, request.method, request.params ?? {}, true)
-    return { kind: 'replayed', dispatched, openRequests }
-  }
-
-  /**
    * Attach a conversation to THIS socket and hand the caller one consistent
    * view of it: the attach result, the ring, and every event exactly once.
    *
@@ -328,7 +278,11 @@ export class RpcConnection extends EventEmitter {
         last_seen: lastSeen,
       }, 10_000)
     } catch (error) {
+      // No ring to judge them by: surface the held live frames as they came.
+      const held = this.acquiringRequests
+      this.acquiringRequests = []
       this.releaseAcquired()
+      for (const request of held) this.surfaceRequest(request.id, request.method, request.params, false)
       throw error
     }
     const sid = result.session_id
@@ -343,7 +297,26 @@ export class RpcConnection extends EventEmitter {
       for (const event of events) this.dispatchSequenced(event, true)
     }
     this.options.watermarks.set(sid, Math.max(this.options.watermarks.get(sid) ?? 0, head))
-    for (const request of ring.open_requests ?? []) this.surfaceRequest(request.id, request.method, request.params ?? {}, true)
+    // The ring is AUTHORITATIVE for what is open (step 6), even for an id this
+    // socket already surfaced: `plan` may have just closed every card as
+    // superseded (a resume snapshot does), and the connection-wide dedupe
+    // then kept the ring from reopening a request Hermes is still waiting on
+    // (round-1 review c2 #1: a live approval arriving mid-resume, or one open
+    // across a truncated reconnect, vanished for good). The reconciler's own
+    // dedupe keeps a card that is still open from appearing twice.
+    const heldLive = new Map(this.acquiringRequests.map((request) => [request.id, request]))
+    this.acquiringRequests = []
+    for (const request of ring.open_requests ?? []) {
+      // A request whose live frame reached THIS socket (now or before) stays
+      // live, so its answer still goes back as a response frame.
+      const held = heldLive.get(request.id)
+      const live = held !== undefined || (this.surfacedRequests.has(request.id) && !this.replayedRequests.has(request.id))
+      this.surfacedRequests.delete(request.id)
+      this.replayedRequests.delete(request.id)
+      this.surfaceRequest(request.id, request.method, held?.params ?? request.params ?? {}, !live)
+    }
+    // A held frame the ring no longer lists was answered or cancelled while
+    // we attached; it is not surfaced at all.
     this.releaseAcquired()
     return { result, ring }
   }
@@ -354,11 +327,6 @@ export class RpcConnection extends EventEmitter {
     for (const event of parked) this.dispatchSequenced(event, false)
   }
 
-  /** Re-deliver `open_requests` from a create/resume/activate snapshot. */
-  surfaceOpenRequests(openRequests: OpenRequestEntry[] | null | undefined): void {
-    for (const request of openRequests ?? []) this.surfaceRequest(request.id, request.method, request.params ?? {}, true)
-  }
-
   close(code = 1000, reason = ''): void {
     if (this.closed) return
     try {
@@ -367,12 +335,6 @@ export class RpcConnection extends EventEmitter {
       // Already closing; the close event (or our synthetic one below) settles state.
     }
     this.onClose(code, reason)
-  }
-
-  private releaseHold(sessionId: string): void {
-    const parked = this.held.get(sessionId) ?? []
-    this.held.delete(sessionId)
-    for (const event of parked) this.dispatchSequenced(event, false)
   }
 
   /** Dispatch a seq'd event once. Returns false when it was a duplicate. */
@@ -429,6 +391,10 @@ export class RpcConnection extends EventEmitter {
         return
       }
       case 'request':
+        if (this.acquiring) {
+          this.acquiringRequests.push({ id: classified.id, method: classified.method, params: classified.params })
+          return
+        }
         this.surfaceRequest(classified.id, classified.method, classified.params, false)
         return
       case 'event': {
@@ -440,10 +406,6 @@ export class RpcConnection extends EventEmitter {
         const sid = event.session_id
         if (sid && typeof event.seq === 'number' && this.acquiring) {
           this.acquiring.push(event)
-          return
-        }
-        if (sid && typeof event.seq === 'number' && this.held.has(sid)) {
-          this.held.get(sid)!.push(event)
           return
         }
         this.dispatchSequenced(event, false)
@@ -463,7 +425,6 @@ export class RpcConnection extends EventEmitter {
       pending.reject(new ConnectionClosedError(pending.method, code, reason))
       this.pending.delete(id)
     }
-    this.held.clear()
     this.acquiring = null
     this.emit('close', { code, reason })
   }

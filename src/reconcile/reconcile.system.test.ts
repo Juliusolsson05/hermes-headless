@@ -342,3 +342,40 @@ describe('durable row identity and tool fallbacks (package review B #3, recorded
     expect(got.semantic.find((event) => event.type === 'tool_result')?.isError).toBe(true)
   })
 })
+
+describe('reconciler guards (round-1 review c2 survivors)', () => {
+  const runtime = (scenario: string) => {
+    const frames = inboundFrames(latestRecording(scenario))
+    const created = frames.map((frame) => frame.result as Record<string, unknown> | undefined)
+      .find((result) => result && typeof result.stored_session_id === 'string' && result.message_count === 0)! as unknown as SessionResumeResult
+    return { created, events: sessionEvents(latestRecording(scenario), created.session_id) }
+  }
+
+  it('M39: a terminal command that exited non-zero is a failed tool, even with no error text', () => {
+    // Mechanical mutation of recorded S4 (terminal result {output, exit_code: 0, error: null}).
+    const { created, events } = runtime('S4')
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(created, 'snapshot')
+    for (const event of events) {
+      const payload = event.payload as { tool_id?: string; result?: Record<string, unknown> } | undefined
+      if (event.type === 'tool.complete' && payload?.tool_id === 'call_tools_0_0') {
+        reconciler.applyEvent({ ...event, payload: { ...payload, result: { ...payload.result, exit_code: 2 } } })
+      } else reconciler.applyEvent(event)
+    }
+    const result = got.semantic.find((event) => event.type === 'tool_result' && (event as { toolUseId?: string }).toolUseId === 'call_tools_0_0') as { isError?: boolean }
+    expect(result.isError).toBe(true)
+  })
+
+  it('M40: a new turn over one whose completion never arrived closes the old one as stopped', () => {
+    // Mechanical mutation of recorded S3: drop the first turn's message.complete.
+    const { created, events } = runtime('S3')
+    const firstComplete = events.findIndex((event) => event.type === 'message.complete')
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(created, 'snapshot')
+    for (const [index, event] of events.entries()) if (index !== firstComplete) reconciler.applyEvent(event)
+    expect(got.semantic.some((event) => event.type === 'turn_stopped' && (event as { stopReason?: string }).stopReason === 'superseded')).toBe(true)
+  })
+})
+

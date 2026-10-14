@@ -93,6 +93,13 @@ describe('token exchange and tickets (recorded S1)', () => {
     expect(tokens.accessToken.length).toBeGreaterThan(20)
   })
 
+  it('M44: a refused sign-in code (generic 400) means sign in again, not a protocol error', async () => {
+    // Justified literal: Hermes answers every token-endpoint failure with a
+    // bare 400 (routes.py auth_native_token); S1 recorded only the success.
+    const impl = async () => new Response(JSON.stringify({ detail: 'invalid_grant' }), { status: 400 })
+    await expect(exchangeCode({ baseUrl: base, code: 'c', codeVerifier: 'v' }, impl)).rejects.toMatchObject({ kind: 'auth-rejected' })
+  })
+
   it('classifies the recorded 401 for a refused bearer as access-expired (refresh, then retry)', async () => {
     // Hermes answers a bad or expired access token with its structured
     // `session_expired` 401 so native clients refresh first. Treating it as
