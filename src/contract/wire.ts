@@ -326,3 +326,34 @@ export type SecretRequestParams = { session_id: string; env_var: string; prompt:
 export type ApprovalResult = { choice: ApprovalChoice; all?: boolean | null }
 export type ClarifyResult = { answers?: Record<string, string | null> | null }
 export type ValueResult = { value: string }
+
+/**
+ * Upstream `CommandsCatalogResult` (tui_gateway/contracts/tools_commands.py,
+ * v0.21.7 and v0.22.0): every slash command the session can run, with
+ * Hermes' own availability metadata. `pairs` are `[name, description]`.
+ * Built-ins marked `gateway_only` (e.g. /restart) are deliberately absent.
+ */
+export type CommandCatalogMeta = {
+  argument_mode?: 'options' | 'text' | 'mixed' | null
+  /**
+   * Desktop availability: null = offered; `hidden` = runs but is not listed;
+   * any other string is a reason it is unavailable outside a terminal
+   * (`terminal`, `messaging`, `settings`, `advanced`, `composer-voice`).
+   */
+  desktop?: string | null
+  desktop_subcommands?: string[] | null
+}
+
+export type CommandsCatalogResult = {
+  pairs?: Array<[string, string] | string[]>
+  sub?: Record<string, string[]>
+  canon?: Record<string, string>
+  commands?: Record<string, CommandCatalogMeta>
+  categories?: Array<{ name: string; pairs?: Array<[string, string] | string[]> }>
+  skills?: Record<string, { usage?: number; origin?: string }>
+  skill_count?: number
+  warning?: string
+}
+
+/** Upstream `TaskIdResult` (prompt.background / prompt.btw). */
+export type TaskIdResult = { task_id: string }

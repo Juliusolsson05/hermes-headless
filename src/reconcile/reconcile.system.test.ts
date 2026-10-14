@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { ConversationReconciler, type CommittedRow, type ReconcilerOutput, type SemanticEvent } from './ConversationReconciler.js'
+import { ConversationReconciler, type CommittedRow, type ReconcilerOutput, type SemanticEvent, type HermesNotice, type HermesSideAnswer } from './ConversationReconciler.js'
 import { classifyFrame, envelopeFromReplay } from '../contract/frames.js'
 import type { EventEnvelope, OpenRequestEntry, SessionResumeResult, TranscriptMessage } from '../contract/wire.js'
 import { corpusScenarios, inboundFrames, latestRecording, type CorpusEntry } from '../testing/corpus.js'
@@ -22,10 +22,12 @@ type Collected = {
   settled: number
   reclaimed: string[]
   unknown: string[]
+  notices: HermesNotice[]
+  sideAnswers: HermesSideAnswer[]
 }
 
 function collector(): { out: ReconcilerOutput; got: Collected } {
-  const got: Collected = { semantic: [], committed: [], resets: [], opened: [], closed: [], settled: 0, reclaimed: [], unknown: [] }
+  const got: Collected = { semantic: [], committed: [], resets: [], opened: [], closed: [], settled: 0, reclaimed: [], unknown: [], notices: [], sideAnswers: [] }
   const out: ReconcilerOutput = {
     semantic: (event) => got.semantic.push(event),
     committed: (row) => got.committed.push(row),
@@ -40,6 +42,9 @@ function collector(): { out: ReconcilerOutput; got: Collected } {
     },
     reclaimed: (reason) => got.reclaimed.push(reason),
     unknown: (shape) => got.unknown.push(shape.eventType),
+    notice: (notice) => got.notices.push(notice),
+    noticeCleared: () => undefined,
+    sideAnswer: (answer) => got.sideAnswers.push(answer),
   }
   return { out, got }
 }

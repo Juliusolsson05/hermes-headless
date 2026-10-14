@@ -294,10 +294,57 @@ export async function mintWsTicket(
   return { ticket: body.ticket, ttlSeconds: typeof body.ttl_seconds === 'number' ? body.ttl_seconds : 30 }
 }
 
-/** `ws(s)://host[/prefix]/api/ws?ticket=…` (Desktop's buildGatewayWsUrlWithTicket). */
-export function buildWsUrl(baseUrl: string, ticket: string): string {
+/** The subprotocol Hermes answers a ticketed upgrade with (web_server_chat.py). */
+export const HERMES_GATEWAY_SUBPROTOCOL = 'hermes-gateway-v1'
+
+/**
+ * `ws(s)://host[/prefix]/api/ws`, WITHOUT the ticket.
+ *
+ * WHY the ticket left the URL (r5, agent-code#1497 Stage B): a query-string
+ * ticket lands in every reverse proxy's access log (Traefik on the owner's
+ * VPS logs request URIs), and upstream's own docs warn about exactly that
+ * (bot-screen.md). It is single-use with a 30 s life, so the exposure was
+ * small, but Hermes has accepted the ticket as a WebSocket subprotocol since
+ * v0.21.7 (web_server_chat.py:208; v0.22.0 :202-218), which no proxy logs.
+ * Pass {@link wsTicketProtocols} as the socket's protocols.
+ */
+export function buildWsUrl(baseUrl: string): string {
   const parsed = new URL(baseUrl)
   const scheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
-  return `${scheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}`
+  return `${scheme}://${parsed.host}${prefix}/api/ws`
+}
+
+/**
+ * `Sec-WebSocket-Protocol: hermes-gateway-v1, hermes-gateway-ticket.<t>`.
+ * Hermes answers with ONLY `hermes-gateway-v1` (it never echoes the ticket),
+ * so a consumer can check `socket.protocol` to prove the server took the
+ * ticket from the header.
+ */
+export function wsTicketProtocols(ticket: string): string[] {
+  return [HERMES_GATEWAY_SUBPROTOCOL, `hermes-gateway-ticket.${ticket}`]
+}
+
+/**
+ * One authenticated JSON request to a dashboard REST route, with the same
+ * error vocabulary as the sign-in calls (so the consumer's broker can treat
+ * a REST 401 exactly like a refused ticket mint: refresh once, then sign
+ * out). Every gated route accepts the native-app bearer
+ * (dashboard_auth/middleware.py:169-180, "RFC 8252 native-app bearer path").
+ */
+export async function authorizedJson<T>(
+  args: { baseUrl: string; accessToken: string; path: string; method?: 'GET' | 'POST'; body?: unknown; what: string },
+  fetchImpl: FetchLike = fetch,
+): Promise<T> {
+  const response = await send(fetchImpl, endpoint(args.baseUrl, args.path), {
+    method: args.method ?? 'GET',
+    headers: {
+      authorization: `Bearer ${args.accessToken}`,
+      ...(args.body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(args.body !== undefined ? { body: JSON.stringify(args.body) } : {}),
+  })
+  const body = await json(response)
+  if (!response.ok) throw statusError(response, args.what, body)
+  return body as T
 }

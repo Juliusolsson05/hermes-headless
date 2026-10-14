@@ -78,6 +78,43 @@ export type ReconcilerOutput = {
    */
   reclaimed(reason: string): void
   unknown(shape: { eventType: string; reason: string }): void
+  /**
+   * Something the user should read that is not part of the conversation:
+   * Hermes' out-of-band notifications, the background memory/skill review,
+   * a risky tool output, a connector the turn waits on. Before
+   * agent-code#1497 every one of these was dropped silently (r4 F9).
+   */
+  notice(notice: HermesNotice): void
+  /** A keyed `notification.show` was withdrawn. */
+  noticeCleared(key: string): void
+  /**
+   * The answer to `/bg` or `/btw`. NOT a turn: `/btw` is answered "from a
+   * snapshot … history, alternation and prompt cache stay untouched"
+   * (methods_prompt.py), and `/bg` runs in its own session. The consumer
+   * shows it beside the conversation, never as an assistant reply.
+   */
+  sideAnswer(answer: HermesSideAnswer): void
+}
+
+export type HermesNotice = {
+  /** Hermes' replace/clear key, or null for a one-off. */
+  key: string | null
+  level: 'info' | 'warn' | 'error' | 'success'
+  /**
+   * Where it came from. `ttl` notices are transient by Hermes' own
+   * definition (the consumer may show them as status text); every other
+   * kind stays readable.
+   */
+  kind: 'sticky' | 'ttl' | 'agent' | 'review' | 'tool-risk' | 'connection'
+  text: string
+}
+
+export type HermesSideAnswer = {
+  taskId: string
+  kind: 'background' | 'btw'
+  /** `/btw` echoes its question; `/bg` does not. */
+  question: string | null
+  text: string
 }
 
 type Block = { index: number; kind: 'text' | 'thinking' | 'tool_use'; text: string; toolUseId?: string }
@@ -126,6 +163,10 @@ function toolResultIsError(payload: ToolCompletePayload): boolean {
   if (typeof result.error === 'string' && result.error) return true
   if (typeof result.exit_code === 'number' && result.exit_code !== 0) return true
   return false
+}
+
+function noticeLevel(level: unknown): HermesNotice['level'] {
+  return level === 'warn' || level === 'error' || level === 'success' ? level : 'info'
 }
 
 export class ConversationReconciler {
@@ -305,6 +346,79 @@ export class ConversationReconciler {
         return
       case 'notice':
         this.out.activity({ active: this.turn !== null, status: String((payload as { message?: string }).message ?? '') || null })
+        return
+      case 'notification.show': {
+        const shown = payload as { text?: string; level?: string; kind?: string; key?: string | null }
+        const text = String(shown.text ?? '').trim()
+        if (!text) return
+        this.out.notice({
+          key: typeof shown.key === 'string' && shown.key ? shown.key : null,
+          level: noticeLevel(shown.level),
+          kind: shown.kind === 'ttl' || shown.kind === 'agent' ? shown.kind : 'sticky',
+          text,
+        })
+        return
+      }
+      case 'notification.clear': {
+        const key = (payload as { key?: string }).key
+        if (typeof key === 'string' && key) this.out.noticeCleared(key)
+        return
+      }
+      case 'review.summary': {
+        const text = String((payload as { text?: string }).text ?? '').trim()
+        if (text) this.out.notice({ key: null, level: 'info', kind: 'review', text })
+        return
+      }
+      case 'subagent.start': {
+        // Activity only (no roster): the parent turn's tool chip already
+        // shows the delegate_task call; this says what the child is doing.
+        const goal = String((payload as { goal?: string }).goal ?? '').trim()
+        this.out.activity({ active: true, status: goal ? `Delegating: ${goal}` : 'Delegating a task' })
+        return
+      }
+      case 'subagent.complete': {
+        const child = payload as { goal?: string; status?: string }
+        const goal = String(child.goal ?? '').trim()
+        const status = typeof child.status === 'string' && child.status ? child.status : 'finished'
+        this.out.activity({ active: this.turn !== null, status: goal ? `Delegated task ${status}: ${goal}` : `Delegated task ${status}` })
+        return
+      }
+      case 'tool.output_risk': {
+        const risk = payload as { name?: string; risk?: string; findings?: unknown; redacted?: boolean }
+        const findings = Array.isArray(risk.findings) ? risk.findings.filter((f): f is string => typeof f === 'string') : []
+        const what = findings.length > 0 ? `: ${findings.join('; ')}` : ''
+        this.out.notice({
+          key: null,
+          level: 'warn',
+          kind: 'tool-risk',
+          text: `Hermes flagged the output of ${String(risk.name ?? 'a tool')} as ${String(risk.risk ?? 'risky')}${what}${risk.redacted ? ' (redacted)' : ''}.`,
+        })
+        return
+      }
+      case 'connection.request':
+        // The connector card is a Hermes Desktop / dashboard surface. Without
+        // saying so the turn simply looked hung until its deadline.
+        this.out.notice({
+          key: null,
+          level: 'warn',
+          kind: 'connection',
+          text: 'Hermes is waiting for you to connect an account. Finish it in Hermes Desktop or the Hermes dashboard; the turn continues once it is connected.',
+        })
+        return
+      case 'background.complete':
+      case 'btw.complete': {
+        const done = payload as { task_id?: string; text?: string; question?: string | null }
+        this.out.sideAnswer({
+          taskId: String(done.task_id ?? ''),
+          kind: event.type === 'btw.complete' ? 'btw' : 'background',
+          question: typeof done.question === 'string' && done.question ? done.question : null,
+          text: String(done.text ?? ''),
+        })
+        return
+      }
+      case 'sessions.changed':
+        // Consumed by HermesHeadless (Telegram-lane refetch); nothing for the
+        // conversation fold itself.
         return
       case 'request.cancel': {
         const cancel = payload as RequestCancelPayload
@@ -584,6 +698,15 @@ export class ConversationReconciler {
     })
     this.emit({ type: 'turn_completed', turnId: turn.turnId })
     this.turn = null
+    // Every answerable request blocks the agent thread, so once the turn has
+    // ended nothing can still be waiting on one. Hermes emits NOTHING to the
+    // other attached clients when one of them answers (server_requests.py
+    // resolve_response, r4 F4), so a card answered in Hermes Desktop or
+    // Telegram stayed up here and silently swallowed the next click
+    // (recorded S22). Closing at turn end is the earliest point that is
+    // provably safe; closing on the next stream frame was considered and
+    // rejected because a spinner frame can arrive while a clarify is open.
+    this.closeAllRequests('settled')
     this.out.activity({ active: false, status: null })
     this.out.turnSettled({ persisted: payload.persisted_turn ?? null, status })
   }

@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { HermesHeadless, type HermesRequest, type HermesSessionState } from './HermesHeadless.js'
 import type { CommittedRow, SemanticEvent } from './reconcile/ConversationReconciler.js'
-import { buildWsUrl, createPkce, exchangeCode, mintWsTicket, endpoint, type HermesTokens } from './auth/index.js'
+import { buildWsUrl, wsTicketProtocols, HERMES_GATEWAY_SUBPROTOCOL, createPkce, exchangeCode, mintWsTicket, endpoint, type HermesTokens } from './auth/index.js'
 import { backendCompatibility } from './version.js'
 import { liveRuntimeAvailable, removeLiveHome, startLiveHermes, type LiveHermes } from './testing/live-hermes/harness.js'
 import { startScriptedModel, type ScriptedModelServer } from './testing/scripted-model/server.js'
@@ -51,12 +51,16 @@ function attach(hermes: () => LiveHermes, tokens: () => HermesTokens, target: Co
     target,
     dial: async () => {
       const { ticket } = await mintWsTicket({ baseUrl: hermes().baseUrl, accessToken: tokens().accessToken })
-      const socket = new WebSocket(buildWsUrl(hermes().baseUrl, ticket))
+      // The ticket rides the subprotocol, never the URL (auth/index.ts buildWsUrl).
+      const socket = new WebSocket(buildWsUrl(hermes().baseUrl), wsTicketProtocols(ticket))
       sockets.push(socket)
       await new Promise<void>((resolve, reject) => {
         socket.addEventListener('open', () => resolve(), { once: true })
         socket.addEventListener('error', () => reject(new Error('socket failed to open')), { once: true })
       })
+      // A REAL server proves it took the ticket from the header: it answers
+      // with the gateway subprotocol alone.
+      expect(socket.protocol).toBe(HERMES_GATEWAY_SUBPROTOCOL)
       return socket
     },
   })

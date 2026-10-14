@@ -24,6 +24,7 @@
 import { EventEmitter } from 'node:events'
 
 import { classifyFrame, envelopeFromReplay } from '../contract/frames.js'
+import { HermesIncompatibleBackendError, INCOMPATIBLE_RPC_CODES } from '../errors.js'
 import type { EventEnvelope, GatewayReadyPayload, RpcErrorBody, SessionEventsSinceResult } from '../contract/wire.js'
 
 /** The subset of the WHATWG WebSocket this class needs; Node 22+ and Electron provide it. */
@@ -148,11 +149,29 @@ export class RpcConnection extends EventEmitter {
    */
   static async open(socket: WebSocketLike, options: RpcConnectionOptions): Promise<RpcConnection> {
     const connection = new RpcConnection(socket, options)
-    const ready = await connection.waitForReady(options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS)
-    connection.readyPayload = ready
-    await connection.call('client.capabilities', { server_requests: true })
-    if (ready.heartbeat === true) connection.startHeartbeat()
-    return connection
+    try {
+      const ready = await connection.waitForReady(options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS)
+      connection.readyPayload = ready
+      try {
+        await connection.call('client.capabilities', { server_requests: true })
+      } catch (error) {
+        // A server older than contract 7 has no `client.capabilities`
+        // (recorded S25, v0.20.4): typed, so the consumer can say "update
+        // Hermes" instead of "failed to start" (agent-code#1495).
+        if (error instanceof RpcError && INCOMPATIBLE_RPC_CODES.has(error.code)) {
+          throw new HermesIncompatibleBackendError('client.capabilities', error.code)
+        }
+        throw error
+      }
+      if (ready.heartbeat === true) connection.startHeartbeat()
+      return connection
+    } catch (error) {
+      // WHY close here: a half-opened socket nobody holds a reference to
+      // would otherwise stay up until the server's idle reap, and keep
+      // receiving broadcasts (r1 H5). The caller only ever sees the error.
+      connection.close(4000, 'handshake-failed')
+      throw error
+    }
   }
 
   /** The backend process identity; a change means every runtime id is void. */

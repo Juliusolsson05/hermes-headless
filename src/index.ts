@@ -8,12 +8,16 @@ export type {
   HermesConnectionState,
   HermesDial,
   HermesHeadlessOptions,
+  HermesLaneState,
   HermesRequest,
+  LaneMove,
   HermesSessionState,
   HermesTarget,
   PromptOutcome,
   SlashOutcome,
 } from './HermesHeadless.js'
+export { HermesIncompatibleBackendError, HermesLaneNotFoundError, HermesStartError, INCOMPATIBLE_RPC_CODES } from './errors.js'
+export type { HermesStartStage } from './errors.js'
 export { RpcConnection, RpcError, RpcTimeoutError, ConnectionClosedError } from './transport/RpcConnection.js'
 export type { ServerRequest, WebSocketLike } from './transport/RpcConnection.js'
 export { ConversationReconciler, HERMES_SEMANTIC_SOURCE } from './reconcile/ConversationReconciler.js'
@@ -26,3 +30,12 @@ export type { BackendCompatibility } from './version.js'
 export { ANSWERABLE_REQUESTS, isAnswerableRequest } from './contract/catalog.js'
 export type { AnswerableRequestMethod } from './contract/catalog.js'
 export type * from './contract/wire.js'
+export { HermesRest } from './rest/HermesRest.js'
+export type { AccessTokenSource, GatewayRestartResult, HermesRestOptions, LatestDescendant, SessionListResult, SessionListRow } from './rest/HermesRest.js'
+export { defaultTelegramLane, pickLaneRow, summarizeLanes } from './lane/lanes.js'
+export type { LaneSummary } from './lane/lanes.js'
+export { isTailBusy, laneTail, STALE_BUSY_TAIL_MS } from './lane/laneBusy.js'
+export type { LaneTail } from './lane/laneBusy.js'
+export { parseSlash, routeSlash } from './slash/routes.js'
+export type { ParsedSlash, SlashRoute } from './slash/routes.js'
+export type { HermesNotice, HermesSideAnswer } from './reconcile/ConversationReconciler.js'
