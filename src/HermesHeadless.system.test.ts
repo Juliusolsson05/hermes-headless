@@ -301,6 +301,8 @@ describe('commands (package review B #2 survivors)', () => {
     const h = harness({ mode: 'resume', storedSessionId: 'deleted-conversation' })
     const replaced: unknown[] = []
     h.headless.on('session-replaced', (event: unknown) => replaced.push(event))
+    const boundaries: Array<{ type: string; reason?: string }> = []
+    h.headless.committed.on('boundary', (boundary: { type: string; reason?: string }) => boundaries.push(boundary))
     const starting = h.headless.start()
     const socket = await h.nextSocket()
     await handshake(socket)
@@ -311,6 +313,8 @@ describe('commands (package review B #2 survivors)', () => {
     await starting
     expect(replaced).toEqual([{ previousStoredSessionId: 'deleted-conversation', reason: 'not-found' }])
     expect(h.headless.storedSessionId).toBe(created.stored_session_id)
+    // Reset as a different conversation, like reattach()'s fallback.
+    expect(boundaries.filter((boundary) => boundary.type === 'reset').map((boundary) => boundary.reason)).toEqual(['new-conversation'])
   })
 
   it('/new closes the old runtime, creates a new one and resets history; a late history reply for the old one is dropped', async () => {

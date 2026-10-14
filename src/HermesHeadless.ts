@@ -173,6 +173,7 @@ export class HermesHeadless extends EventEmitter {
   async start(): Promise<void> {
     const connection = await this.connect()
     const target = this.options.target
+    let replaced = false
     if (target.mode === 'resume') {
       try {
         await this.attachByResume(connection, target.storedSessionId)
@@ -180,6 +181,7 @@ export class HermesHeadless extends EventEmitter {
       } catch (error) {
         if (!(error instanceof RpcError) || error.code !== SESSION_NOT_FOUND) throw error
         this.emit('session-replaced', { previousStoredSessionId: target.storedSessionId, reason: 'not-found' })
+        replaced = true
       }
     }
     await connection.acquire(
@@ -189,7 +191,11 @@ export class HermesHeadless extends EventEmitter {
         ...(target.mode === 'create' && target.title ? { title: target.title } : {}),
       }),
       (created) => {
-        this.reconciler.applySnapshot(created, 'snapshot')
+        // A replacement is a DIFFERENT conversation, reset as one (the reason
+        // a consumer uses to drop the old conversation's live turns), exactly
+        // as reattach()'s fallback does (round-2 review x2 suspicion).
+        if (replaced) this.reconciler.beginNewConversation(created)
+        else this.reconciler.applySnapshot(created, 'snapshot')
         this.pendingTurns = 0
         return { fromSeq: null }
       },

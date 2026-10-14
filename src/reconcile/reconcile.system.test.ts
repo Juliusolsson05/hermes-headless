@@ -377,5 +377,24 @@ describe('reconciler guards (round-1 review c2 survivors)', () => {
     for (const [index, event] of events.entries()) if (index !== firstComplete) reconciler.applyEvent(event)
     expect(got.semantic.some((event) => event.type === 'turn_stopped' && (event as { stopReason?: string }).stopReason === 'superseded')).toBe(true)
   })
+
+  it('commits a tool row with the result observed live, since Hermes\' history drops it (round-2 x1 #1)', () => {
+    // Recorded S4: three tool calls, the second a failed read. The resume
+    // projection's tool rows carry no output; the live tool.complete did.
+    const { created, events } = runtime('S4')
+    const resumed = inboundFrames(latestRecording('S4')).map((frame) => frame.result as { messages?: TranscriptMessage[] } | undefined)
+      .filter((result) => Array.isArray(result?.messages) && result!.messages!.length > 0).at(-1)!.messages!
+    expect(resumed.filter((row) => row.role === 'tool').every((row) => row.content === undefined || row.content === null)).toBe(true)
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(created, 'snapshot')
+    for (const event of events) reconciler.applyEvent(event)
+    reconciler.applyHistory(resumed)
+    const tools = got.committed.filter((row) => row.row.role === 'tool').map((row) => row.row as TranscriptMessage & { tool_error?: boolean })
+    expect(tools.map((row) => [row.tool_call_id, row.tool_error === true])).toEqual([
+      ['call_tools_0_0', false], ['call_tools_0_1', true], ['call_tools_1_0', false],
+    ])
+    expect(tools.every((row) => typeof row.content === 'string' && row.content.length > 0)).toBe(true)
+  })
 })
 

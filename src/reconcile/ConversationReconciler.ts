@@ -130,6 +130,8 @@ function toolResultIsError(payload: ToolCompletePayload): boolean {
 
 export class ConversationReconciler {
   private storedSessionId = ''
+  /** Results seen live by tool call id; see withLiveToolResult. Cleared per conversation. */
+  private readonly liveToolResults = new Map<string, { content: string; isError: boolean }>()
   private runtimeSessionId = ''
   private title: string | null = null
   private info: SessionLiveInfo | null = null
@@ -351,6 +353,7 @@ export class ConversationReconciler {
   /** `/new`: the pane keeps its identity, the conversation starts over. */
   beginNewConversation(result: SessionResumeResult & { stored_session_id?: string | null }): void {
     this.knownRowIds = []
+    this.liveToolResults.clear()
     this.applySnapshot(result, 'new-conversation')
   }
 
@@ -374,7 +377,26 @@ export class ConversationReconciler {
     const key = rowKey(row, index)
     if (this.emittedKeys.has(key)) return
     this.emittedKeys.add(key)
-    this.out.committed({ key, storedSessionId: this.storedSessionId, row })
+    this.out.committed({ key, storedSessionId: this.storedSessionId, row: this.withLiveToolResult(row) })
+  }
+
+  /**
+   * Hermes' history projection drops tool output (recorded S4: tool rows carry
+   * only role/name/context/tool_call_id/timestamp/args), yet the committed row
+   * OWNS its tool unit downstream (the ledger claims by call id). Committed
+   * bare, every chip lost its output the moment a turn's history landed, and
+   * a failed call turned into a success (round-2 review x1 #1). This is the
+   * one place the live result and the committed row meet, so the result
+   * observed live is attached here: `content` as Hermes would have stored it,
+   * and `tool_error` (an Agent Code key, not Hermes') for its failure flag.
+   * After a reload nothing was observed live and the row stays bare.
+   */
+  private withLiveToolResult(row: TranscriptMessage): TranscriptMessage {
+    if (row.role !== 'tool' || typeof row.tool_call_id !== 'string') return row
+    if (row.content !== undefined && row.content !== null && row.content !== '') return row
+    const live = this.liveToolResults.get(row.tool_call_id)
+    if (!live) return row
+    return { ...row, content: live.content, ...(live.isError ? { tool_error: true } : {}) } as TranscriptMessage
   }
 
   private emit(event: Omit<SemanticEvent, 'source'>): void {
@@ -519,12 +541,14 @@ export class ConversationReconciler {
       : typeof payload.summary === 'string' && payload.summary
         ? payload.summary
         : textOf(payload.result)
+    const isError = toolResultIsError(payload)
+    this.liveToolResults.set(payload.tool_id, { content, isError })
     this.emit({
       type: 'tool_result',
       turnId: turn.turnId,
       toolUseId: payload.tool_id,
       content,
-      isError: toolResultIsError(payload),
+      isError,
       durationSeconds: payload.duration_s ?? null,
       inlineDiff: payload.inline_diff ?? null,
     })
