@@ -96,6 +96,19 @@ export type ReconcilerOutput = {
   sideAnswer(answer: HermesSideAnswer): void
 }
 
+/**
+ * Tool results observed LIVE, by tool call id. Hermes' history projection
+ * drops tool output (recorded S4), so this is the only place a committed tool
+ * row gets its output back. A consumer that rebuilds the client for the same
+ * conversation (Reload Agent) passes one cache that outlives it; otherwise a
+ * reload turned every chip into "output is kept on your server" (owner's
+ * debug bundle 2026-10-14T16-26-49: 187 of 206 chips).
+ */
+export type ToolResultCache = {
+  get(toolCallId: string): { content: string; isError: boolean } | undefined
+  set(toolCallId: string, result: { content: string; isError: boolean }): void
+}
+
 export type HermesNotice = {
   /** Hermes' replace/clear key, or null for a one-off. */
   key: string | null
@@ -182,7 +195,7 @@ function noticeLevel(level: unknown): HermesNotice['level'] {
 export class ConversationReconciler {
   private storedSessionId = ''
   /** Results seen live by tool call id; see withLiveToolResult. Cleared per conversation. */
-  private readonly liveToolResults = new Map<string, { content: string; isError: boolean }>()
+  private readonly liveToolResults: ToolResultCache
   private runtimeSessionId = ''
   private title: string | null = null
   private info: SessionLiveInfo | null = null
@@ -194,7 +207,13 @@ export class ConversationReconciler {
   private readonly openRequests = new Set<string>()
   private readonly unknownTypes = new Set<string>()
 
-  constructor(private readonly out: ReconcilerOutput) {}
+  /** True when the consumer owns the cache (it outlives this reconciler; never cleared here). */
+  private readonly sharedResults: boolean
+
+  constructor(private readonly out: ReconcilerOutput, toolResults?: ToolResultCache) {
+    this.liveToolResults = toolResults ?? new Map()
+    this.sharedResults = toolResults !== undefined
+  }
 
   get currentStoredSessionId(): string {
     return this.storedSessionId
@@ -488,7 +507,10 @@ export class ConversationReconciler {
   /** `/new`: the pane keeps its identity, the conversation starts over. */
   beginNewConversation(result: SessionResumeResult & { stored_session_id?: string | null }): void {
     this.knownRowIds = []
-    this.liveToolResults.clear()
+    // A consumer-owned cache is keyed by tool call id, which is unique
+    // across conversations; clearing it would drop results another pane of
+    // the previous conversation (or a later reload of it) still needs.
+    if (!this.sharedResults) (this.liveToolResults as Map<string, unknown>).clear()
     this.applySnapshot(result, 'new-conversation')
   }
 

@@ -37,7 +37,7 @@ import { defaultTelegramLane, pickLaneRow, summarizeLanes, type LaneSummary } fr
 import { isTailBusy, laneTail, STALE_BUSY_TAIL_MS, type LaneTail } from './lane/laneBusy.js'
 import type { HermesRest } from './rest/HermesRest.js'
 import { parseSlash, routeSlash } from './slash/routes.js'
-import type { HermesNotice, HermesSideAnswer } from './reconcile/ConversationReconciler.js'
+import type { HermesNotice, HermesSideAnswer, ToolResultCache } from './reconcile/ConversationReconciler.js'
 import { ConversationReconciler } from './reconcile/ConversationReconciler.js'
 import { ConnectionClosedError, RpcConnection, RpcError, RpcTimeoutError, type ServerRequest, type WebSocketLike } from './transport/RpcConnection.js'
 
@@ -141,6 +141,8 @@ export type HermesHeadlessOptions = {
   laneDebounceMs?: number
   /** Injected clock for the stale-busy rule in tests. */
   now?: () => number
+  /** Consumer-owned live tool results that outlive this instance (ToolResultCache). */
+  toolResults?: ToolResultCache
   requestTimeoutMs?: number
   /** Overrides for tests. */
   heartbeatIntervalMs?: number
@@ -226,7 +228,7 @@ export class HermesHeadless extends EventEmitter {
       notice: (notice: HermesNotice) => this.emit('notice', notice),
       noticeCleared: (key: string) => this.emit('notice-cleared', { key }),
       sideAnswer: (answer: HermesSideAnswer) => this.emit('side-answer', answer),
-    })
+    }, options.toolResults)
   }
 
   get storedSessionId(): string {

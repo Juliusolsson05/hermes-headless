@@ -444,3 +444,23 @@ describe('history resets during a running turn (bundle 2026-10-14T16-26-49)', ()
     expect(afterReset.find((event) => event.type === 'tool_result' && event.toolUseId === toolId)).toBeDefined()
   })
 })
+
+describe('tool output across a client rebuild (bundle 2026-10-14T16-26-49: 187 of 206 chips lost theirs)', () => {
+  it('a second client of the same conversation commits tool rows with the output the first saw live (recorded S4)', () => {
+    const entries = latestRecording('S4')
+    const [session] = createdSessions(entries)
+    const cache = new Map<string, { content: string; isError: boolean }>()
+    const first = new ConversationReconciler(collector().out, cache)
+    first.applySnapshot(session.result, 'snapshot')
+    for (const event of sessionEvents(entries, session.sid)) first.applyEvent(event)
+    // Reload Agent: a NEW client resumes the conversation (recorded resume rows).
+    const resumed = inboundFrames(entries).map((frame) => frame.result as Record<string, unknown> | undefined)
+      .filter((result) => Array.isArray(result?.messages) && (result!.messages as unknown[]).length > 0).at(-1) as unknown as SessionResumeResult
+    const { out, got } = collector()
+    new ConversationReconciler(out, cache).applySnapshot(resumed, 'snapshot', { seedInflight: false })
+    const tools = got.committed.filter((row) => row.row.role === 'tool')
+    expect(tools).toHaveLength(3)
+    expect(tools.every((row) => typeof row.row.content === 'string' && (row.row.content as string).length > 0)).toBe(true)
+    expect(tools.map((row) => row.row.tool_error === true)).toEqual([false, true, false])
+  })
+})
