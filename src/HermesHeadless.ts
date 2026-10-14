@@ -20,7 +20,9 @@ import { EventEmitter } from 'node:events'
 import { CommittedChannel, ScreenChannel, SemanticChannel } from './channels/index.js'
 import { isAnswerableRequest, type AnswerableRequestMethod } from './contract/catalog.js'
 import type {
+  CommandsCatalogResult,
   CompleteSlashResult,
+  TranscriptMessage,
   OpenRequestEntry,
   PromptSubmitResult,
   SessionCreateResult,
@@ -28,7 +30,14 @@ import type {
   SessionLiveInfo,
   SessionResumeResult,
   SlashExecResult,
+  TaskIdResult,
 } from './contract/wire.js'
+import { HermesLaneNotFoundError, HermesStartError, type HermesStartStage } from './errors.js'
+import { defaultTelegramLane, pickLaneRow, summarizeLanes, type LaneSummary } from './lane/lanes.js'
+import { isTailBusy, laneTail, STALE_BUSY_TAIL_MS, type LaneTail } from './lane/laneBusy.js'
+import type { HermesRest } from './rest/HermesRest.js'
+import { parseSlash, routeSlash } from './slash/routes.js'
+import type { HermesNotice, HermesSideAnswer, ToolResultCache } from './reconcile/ConversationReconciler.js'
 import { ConversationReconciler } from './reconcile/ConversationReconciler.js'
 import { ConnectionClosedError, RpcConnection, RpcError, RpcTimeoutError, type ServerRequest, type WebSocketLike } from './transport/RpcConnection.js'
 
@@ -37,6 +46,32 @@ export type HermesDial = () => Promise<WebSocketLike>
 export type HermesTarget =
   | { mode: 'create'; source: string; title?: string }
   | { mode: 'resume'; storedSessionId: string }
+  /**
+   * Follow a messaging lane (the owner's Telegram DM thread) instead of a
+   * fixed stored conversation: the stored id is re-resolved from the
+   * gateway's routing key on open, on every `sessions.changed`, on the
+   * backstop poll and before every prompt (lane/lanes.ts says why).
+   * Requires `rest`.
+   */
+  | { mode: 'lane'; sessionKey: string; profile?: string }
+
+/** The lane's live state, for the consumer's "replying on Telegram" line and held prompts. */
+export type HermesLaneState = {
+  sessionKey: string
+  storedSessionId: string | null
+  /** A turn from ANOTHER surface (the phone) is running on the lane. */
+  busy: boolean
+  /** Prompts the pane is holding until the lane is free, oldest first. */
+  held: Array<{ id: string; text: string; heldAt: number }>
+}
+
+/** Why the lane's stored conversation changed under the pane. */
+export type LaneMove = {
+  from: string
+  to: string
+  /** `compression` is seamless; anything else is a different conversation (Telegram /new, /resume). */
+  reason: 'compression' | 'new-conversation'
+}
 
 export type HermesConnectionState =
   | { kind: 'connecting' }
@@ -64,11 +99,18 @@ export type SlashOutcome =
   | { kind: 'prefill'; text: string }
   | { kind: 'new-conversation' }
   | { kind: 'stopped' }
+  /** `/bg` or `/btw` started; its answer arrives later as a `side-answer` event. */
+  | { kind: 'side-task'; taskId: string; side: 'background' | 'btw' }
 
 export type PromptOutcome = {
-  /** `queued`: Hermes is holding it until the running turn ends. */
-  status: PromptSubmitResult['status']
+  /**
+   * `queued`: Hermes is holding it until the running turn ends.
+   * `held`: Telegram-lane mode is holding it HERE, unsent, until the phone's
+   * turn finishes (lane/laneBusy.ts); `holdId` names it for release/cancel.
+   */
+  status: PromptSubmitResult['status'] | 'held'
   userRowId: number | null
+  holdId?: string
 }
 
 /**
@@ -87,6 +129,20 @@ export class HermesPromptError extends Error {
 export type HermesHeadlessOptions = {
   dial: HermesDial
   target: HermesTarget
+  /** The dashboard REST client. Required for `target.mode === 'lane'`. */
+  rest?: HermesRest
+  /**
+   * Lane backstop poll. `sessions.changed` is the primary signal (≤ 2.5 s);
+   * the poll covers a missed broadcast. 30 s is what Hermes Desktop uses when
+   * the server advertises change events (use-background-sync.ts:656-658).
+   */
+  laneBackstopMs?: number
+  /** Debounce for bursts of `sessions.changed` (Hermes floors them at 2 s, but several clients may echo). */
+  laneDebounceMs?: number
+  /** Injected clock for the stale-busy rule in tests. */
+  now?: () => number
+  /** Consumer-owned live tool results that outlive this instance (ToolResultCache). */
+  toolResults?: ToolResultCache
   requestTimeoutMs?: number
   /** Overrides for tests. */
   heartbeatIntervalMs?: number
@@ -118,14 +174,49 @@ export class HermesHeadless extends EventEmitter {
    */
   private pendingTurns = 0
 
+  // ── Telegram-lane mode (plan Stage D); all inert for create/resume ─────────
+  /** User rows WE submitted: our own turn at the tail is not "the phone is busy". */
+  private readonly ownUserRowIds = new Set<number>()
+  /** The last `session.history` result, for the busy rule. */
+  private lastHistory: TranscriptMessage[] | null = null
+  private laneBusy = false
+  /** The tail the busy rule last saw and when it first saw it (local clock), for STALE_BUSY_TAIL_MS. */
+  private laneTailSeen: { key: string; since: number } | null = null
+  private readonly held: Array<{ id: string; text: string; heldAt: number }> = []
+  private holdCounter = 0
+  private draining = false
+  private laneRefresh: Promise<boolean> | null = null
+  private laneRefreshAgain = false
+  private laneDebounce: ReturnType<typeof setTimeout> | null = null
+  private laneBackstop: ReturnType<typeof setInterval> | null = null
+  private lanePollingPaused = false
+  private readonly now: () => number
+  /**
+   * Our turn is waiting on Hermes' cross-process turn lease, i.e. ANOTHER
+   * surface (the phone) holds the conversation. Plan H3, refined by Stage 0:
+   * in the recorded phone-first race (T4) the tail rule read "idle" for ~5 s
+   * because the tail was our own just-submitted row, while the phone turn
+   * was still running; the lease status is the signal that covers it. Set by
+   * "Another Hermes process is using this session", cleared by "Session is
+   * free" (both recorded, T4:69/79) or by our turn settling.
+   */
+  private leaseWait = false
+
   constructor(private readonly options: HermesHeadlessOptions) {
     super()
+    this.now = options.now ?? Date.now
+    if (options.target.mode === 'lane' && !options.rest) {
+      throw new Error('HermesHeadless: a lane target needs the REST client (options.rest).')
+    }
     this.reconciler = new ConversationReconciler({
       semantic: (event) => this.semantic.publish(event),
       committed: (row) => this.committed.publishRow(row),
       historyReset: (generation, reason) => this.committed.publishBoundary({ type: 'reset', generation, reason }),
       historyCaughtUp: (generation) => this.committed.publishBoundary({ type: 'caught-up', generation }),
-      activity: (state) => this.screen.publishActivity(state),
+      activity: (state) => {
+        this.noteLeaseStatus(state.status)
+        this.screen.publishActivity(state)
+      },
       session: (state) => this.emit('session', state satisfies HermesSessionState),
       requestOpened: (request) => {
         if (isAnswerableRequest(request.method)) {
@@ -134,8 +225,11 @@ export class HermesHeadless extends EventEmitter {
       },
       requestClosed: (id, reason) => this.emit('request-closed', { id, reason }),
       turnSettled: () => {
+        this.leaseWait = false
         this.pendingTurns = Math.max(0, this.pendingTurns - 1)
-        this.scheduleHistoryFetch()
+        // In lane mode our turn ending can free held prompts only after the
+        // tail is re-read (a phone message may have queued behind it).
+        void this.scheduleHistoryFetch().then(() => this.evaluateLane())
       },
       reclaimed: () => {
         void this.reattach().catch((error: unknown) => this.emit('connection', {
@@ -145,7 +239,10 @@ export class HermesHeadless extends EventEmitter {
         } satisfies HermesConnectionState))
       },
       unknown: (shape) => this.emit('unknown', shape),
-    })
+      notice: (notice: HermesNotice) => this.emit('notice', notice),
+      noticeCleared: (key: string) => this.emit('notice-cleared', { key }),
+      sideAnswer: (answer: HermesSideAnswer) => this.emit('side-answer', answer),
+    }, options.toolResults)
   }
 
   get storedSessionId(): string {
@@ -171,8 +268,43 @@ export class HermesHeadless extends EventEmitter {
    * instead of leaving the pane dead. reattach() does the same on reconnect.
    */
   async start(): Promise<void> {
-    const connection = await this.connect()
+    // WHY the stage is tracked here and not in connect(): connect() also
+    // serves reconnect(), whose caller (the app's reconnect loop) branches on
+    // the RAW dial error types (signed out, connection removed). Only the
+    // first start needs "where did it fail" for the user-facing sentence
+    // (agent-code#1495), so only start() wraps.
+    let stage: HermesStartStage = 'dial'
+    try {
+      const connection = await this.connect(() => {
+        stage = 'handshake'
+      })
+      stage = 'attach'
+      await this.bindTarget(connection)
+    } catch (error) {
+      // An attach failure left the socket (and its heartbeat) open, and the
+      // app's failed-spawn path never stops the session: one leaked socket
+      // per retry (review). Same teardown as detach().
+      this.connectGeneration += 1
+      this.connection?.close(1000, 'start-failed')
+      this.connection = null
+      throw new HermesStartError(stage, error)
+    }
+  }
+
+  /** start()'s attach step: resume (with the 4007 fallback) or create. */
+  private async bindTarget(connection: RpcConnection): Promise<void> {
     const target = this.options.target
+    if (target.mode === 'lane') {
+      const tip = await this.resolveLaneTip()
+      if (!tip) throw new HermesLaneNotFoundError(target.sessionKey)
+      await this.attachByResume(connection, tip)
+      this.startLaneBackstop()
+      // The resume already fetched history; evaluate busy from it so a pane
+      // opened DURING a phone turn shows it immediately.
+      await this.scheduleHistoryFetch()
+      this.evaluateLane()
+      return
+    }
     let replaced = false
     if (target.mode === 'resume') {
       try {
@@ -214,7 +346,31 @@ export class HermesHeadless extends EventEmitter {
   async reconnect(): Promise<void> {
     const runtime = this.reconciler.currentRuntimeSessionId
     const previousEpoch = this.epoch
+    const hadTurn = this.turnInFlight
     const connection = await this.connect()
+    if (hadTurn && previousEpoch && connection.epoch !== previousEpoch) {
+      // A NEW backend process: the turn that was running died with the old
+      // one (its reply is not in the store; Hermes retires undrained queue
+      // rows on resume, #125577). The resume below silently resets the
+      // bubble, so say it, or the pane looks like the answer just vanished
+      // (r4 F7, plan Stage A).
+      this.emit('turn-lost', { reason: 'backend-restarted' })
+      this.leaseWait = false
+    }
+    if (this.options.target.mode === 'lane') {
+      // Whatever happened while we were away (Telegram /new, compression),
+      // the lane must be re-resolved once we are attached again.
+      try {
+        await this.reconnectAttach(connection, runtime, previousEpoch)
+      } finally {
+        void this.refreshLane()
+      }
+      return
+    }
+    await this.reconnectAttach(connection, runtime, previousEpoch)
+  }
+
+  private async reconnectAttach(connection: RpcConnection, runtime: string, previousEpoch: string | null): Promise<void> {
     if (runtime && previousEpoch && connection.epoch === previousEpoch) {
       const lastSeen = this.watermarks.get(runtime) ?? 0
       let truncated = false
@@ -285,14 +441,21 @@ export class HermesHeadless extends EventEmitter {
    * order) and the snapshot's partial `inflight` text is not seeded; only
    * when the ring lost the start does the snapshot's text stand in.
    */
-  private async attachByResume(connection: RpcConnection, storedSessionId: string): Promise<void> {
+  private async attachByResume(connection: RpcConnection, storedSessionId: string, reason: 'snapshot' | 'new-conversation' = 'snapshot'): Promise<void> {
     await connection.acquire(
       () => connection.call<SessionResumeResult>('session.resume', { session_id: storedSessionId, cols: 96 }),
       (resumed, ring) => {
         const turnStart = openTurnStart(ring.events, resumed.session_id)
         this.watermarks.clear()
-        this.reconciler.applySnapshot(resumed, 'snapshot', { seedInflight: turnStart === null })
+        // A lane that moved to a DIFFERENT conversation (Telegram /new) resets
+        // as one, so the consumer draws its divider and drops the old turn.
+        if (reason === 'new-conversation') this.reconciler.beginNewConversation(resumed)
+        else this.reconciler.applySnapshot(resumed, 'snapshot', { seedInflight: turnStart === null })
         this.pendingTurns = resumed.running ? 1 : 0
+        // The turn state is rebuilt from the server: a lease wait we were in
+        // is over (restart, reclaim, lane move); keeping it held every prompt
+        // forever (review, both reviewers).
+        this.leaseWait = false
         // A long turn (> the 512-event ring) whose start was evicted, but which
         // completed between the rebind and the ring read: the snapshot seeded
         // it as running and nothing would ever settle it, so dispatch the
@@ -322,20 +485,52 @@ export class HermesHeadless extends EventEmitter {
    * is Hermes' flag for "hold it until the turn ends" (prompt_voice.py:
    * "the busy path must hold it, never redirect/steer").
    */
-  async prompt(text: string): Promise<PromptOutcome> {
+  async prompt(text: string, options: { force?: boolean } = {}): Promise<PromptOutcome> {
+    if (this.options.target.mode === 'lane') {
+      if (!this.connection?.isOpen || !this.reconciler.currentRuntimeSessionId) throw new HermesPromptError('not-ready', 'Hermes is not connected.')
+      // BEFORE every submit (t1 F2e): a pane still holding the id from before
+      // a Telegram /new would REOPEN that ended row and fork the thread.
+      // refreshLane also refetches history, so the busy decision below is
+      // made on the tail as of now, not as of the last signal.
+      const fresh = await this.refreshLane()
+      // FAIL CLOSED (review, hermes-headless#2): when the tip could not be
+      // re-resolved (REST 502 while the gateway restarts, a timeout), sending
+      // now could reopen an ended row (F2e) or land inside a phone turn (T4).
+      // Hold instead; the next successful refresh (change signal or the
+      // backstop poll) sends it, and "Send now" stays the user's escape.
+      if (!options.force && (!fresh || this.laneBusy || this.held.length > 0)) {
+        // Behind a running phone turn, or behind earlier held prompts (order
+        // is the user's order). See lane/laneBusy.ts for why holding is not
+        // optional.
+        const hold = { id: `hold-${++this.holdCounter}`, text, heldAt: this.now() }
+        this.held.push(hold)
+        this.emitLane()
+        return { status: 'held', userRowId: null, holdId: hold.id }
+      }
+    }
+    return this.submit(text)
+  }
+
+  private async submit(text: string): Promise<PromptOutcome> {
     const connection = this.connection
     const runtime = this.reconciler.currentRuntimeSessionId
     if (!connection?.isOpen || !runtime) throw new HermesPromptError('not-ready', 'Hermes is not connected.')
-    const busy = this.turnInFlight
     // Counted BEFORE the call resolves: a second prompt sent while this one
     // is still in flight must already see it.
     this.pendingTurns += 1
     try {
+      // ALWAYS `queued: true` (r4 F3, plan H1/H2). Hermes reads it only on its
+      // busy path (methods_prompt.py:808-826), so an idle submit is unchanged
+      // (recorded S23). It matters when the session is busy for a reason this
+      // client cannot see: another client's prompt in the ~1.3 s before its
+      // `message.start`, a server-started turn. Sent without it, the default
+      // `display.busy_input_mode=interrupt` REDIRECTS that other turn.
       const result = await connection.call<PromptSubmitResult>('prompt.submit', {
         session_id: runtime,
         text,
-        ...(busy ? { queued: true } : {}),
+        queued: true,
       })
+      if (typeof result.user_row_id === 'number') this.ownUserRowIds.add(result.user_row_id)
       // `steered` folds the text into the running turn: no turn of its own
       // will settle for it.
       if (result.status === 'steered') this.pendingTurns = Math.max(0, this.pendingTurns - 1)
@@ -365,6 +560,11 @@ export class HermesHeadless extends EventEmitter {
    * conversation stays resumable in Hermes; `session.close` does not delete.
    */
   async newConversation(): Promise<void> {
+    if (this.options.target.mode === 'lane') {
+      // serve has no RPC that resets the GATEWAY's routing for the lane; a
+      // session.create here would quietly leave the Telegram thread.
+      throw new HermesPromptError('refused', 'A Telegram-thread pane cannot start a new conversation; type /new in Telegram.')
+    }
     const connection = this.requireConnection()
     const runtime = this.reconciler.currentRuntimeSessionId
     if (runtime) {
@@ -405,6 +605,13 @@ export class HermesHeadless extends EventEmitter {
     await this.answerRequest(request.id, decline[request.method])
   }
 
+  /** Every slash command this session can run, with Hermes' availability metadata (plan Stage E). */
+  async commandCatalog(): Promise<CommandsCatalogResult> {
+    return this.requireConnection().call<CommandsCatalogResult>('commands.catalog', {
+      session_id: this.reconciler.currentRuntimeSessionId,
+    })
+  }
+
   async completeSlash(text: string): Promise<CompleteSlashResult> {
     return this.requireConnection().call<CompleteSlashResult>('complete.slash', {
       text,
@@ -413,26 +620,57 @@ export class HermesHeadless extends EventEmitter {
   }
 
   /**
-   * Run `/command args` the way Hermes Desktop does (recorded S13):
+   * Run `/command args` the way Hermes Desktop does (slash/routes.ts says why
+   * each family goes where it goes; recorded S13, S18–S20):
    *  - `/new` and `/stop` are client-side (`/stop` must interrupt the turn
-   *    first; Hermes' own `/stop` only stops background processes);
+   *    first; Hermes' own `/stop` only stops background processes, so it is
+   *    still forwarded afterwards);
+   *  - `/bg`, `/btw` → side-agent RPCs; the answer arrives as `side-answer`;
+   *  - `/compress`, `/title`, `/status`, `/save` → their session RPCs;
    *  - everything else → `slash.exec`; a skill or quick command answers 4018
    *    "use command.dispatch", whose directive is a prompt to submit.
    */
   async runSlash(input: string): Promise<SlashOutcome> {
-    const body = input.trim().replace(/^\//, '')
-    const [name = '', ...rest] = body.split(/\s+/)
-    const arg = rest.join(' ')
-    if (name === 'new' || name === 'reset') {
+    const { name, arg, body } = parseSlash(input)
+    const route = routeSlash(name)
+    if (route.kind === 'new-conversation') {
       await this.newConversation()
       return { kind: 'new-conversation' }
     }
     const connection = this.requireConnection()
     const runtime = this.reconciler.currentRuntimeSessionId
-    if (name === 'stop') {
-      await this.interrupt()
-      await connection.call('slash.exec', { session_id: runtime, command: body }).catch(() => undefined)
-      return { kind: 'stopped' }
+    switch (route.kind) {
+      case 'stop':
+        await this.interrupt()
+        await connection.call('slash.exec', { session_id: runtime, command: body }).catch(() => undefined)
+        return { kind: 'stopped' }
+      case 'side': {
+        if (!arg) return { kind: 'output', text: `Usage: /${name} <what to ${route.side === 'btw' ? 'ask' : 'do'}>` }
+        const started = await connection.call<TaskIdResult>(route.side === 'btw' ? 'prompt.btw' : 'prompt.background', { session_id: runtime, text: arg })
+        return { kind: 'side-task', taskId: String(started.task_id ?? ''), side: route.side }
+      }
+      case 'compress': {
+        const result = await connection.call<Record<string, unknown>>('session.compress', { session_id: runtime, ...(arg ? { focus_topic: arg } : {}) })
+        // The compressed transcript has new row ids; the history fetch
+        // turns that into one rewrite reset instead of duplicates (S12).
+        void this.scheduleHistoryFetch()
+        return { kind: 'output', text: compressSummary(result) }
+      }
+      case 'title': {
+        const result = await connection.call<{ title?: string; pending?: boolean }>('session.title', { session_id: runtime, ...(arg ? { title: arg } : {}) })
+        const title = String(result.title ?? '')
+        return { kind: 'output', text: arg ? `Renamed to "${title}"${result.pending ? ' (applied after the first message)' : ''}.` : `Title: ${title || '(untitled)'}` }
+      }
+      case 'status': {
+        const result = await connection.call<{ output?: string }>('session.status', { session_id: runtime })
+        return { kind: 'output', text: String(result.output ?? '') }
+      }
+      case 'save': {
+        const result = await connection.call<{ file?: string | null }>('session.save', { session_id: runtime })
+        return { kind: 'output', text: result.file ? `Saved the transcript on the Hermes server: ${result.file}` : 'Saved the transcript on the Hermes server.' }
+      }
+      case 'exec':
+        break
     }
     let result: SlashExecResult
     try {
@@ -443,10 +681,25 @@ export class HermesHeadless extends EventEmitter {
     }
     if ((result.type === 'skill' || result.type === 'send') && result.message) {
       const outcome = await this.prompt(result.message)
-      return { kind: 'prompt', result: { status: outcome.status, user_row_id: outcome.userRowId }, display: result.display ?? `/${name}` }
+      return { kind: 'prompt', result: { status: outcome.status === 'held' ? 'queued' : outcome.status, user_row_id: outcome.userRowId }, display: result.display ?? `/${name}` }
     }
     if (result.type === 'prefill' && result.message) return { kind: 'prefill', text: result.message }
     return { kind: 'output', text: result.output ?? result.notice ?? result.display ?? '', warning: result.warning ?? null }
+  }
+
+  /**
+   * Let go of the socket but stay resumable: a later reconnect() re-attaches
+   * the same conversation. For a consumer whose credentials died (signed
+   * out): unlike stop(), a fresh sign-in can bring the pane back without
+   * rebuilding it (owner's debug bundle 2026-10-14T16-26-49, a pane that
+   * stayed dead until Reload Agent).
+   */
+  async detach(): Promise<void> {
+    // Invalidates a dial in flight, like stop().
+    this.connectGeneration += 1
+    const connection = this.connection
+    this.connection = null
+    connection?.close(1000, 'client-detach')
   }
 
   /**
@@ -455,6 +708,10 @@ export class HermesHeadless extends EventEmitter {
    */
   async stop(): Promise<void> {
     this.stopped = true
+    if (this.laneDebounce) clearTimeout(this.laneDebounce)
+    if (this.laneBackstop) clearInterval(this.laneBackstop)
+    this.laneDebounce = null
+    this.laneBackstop = null
     // Invalidates a dial still in flight (review A #6): when it resolves,
     // connect() sees a newer generation and closes that socket.
     this.connectGeneration += 1
@@ -470,7 +727,8 @@ export class HermesHeadless extends EventEmitter {
     return this.connection
   }
 
-  private async connect(): Promise<RpcConnection> {
+  /** `onDialed` fires once the socket is open and the JSON-RPC handshake starts (start()'s stage tracking). */
+  private async connect(onDialed?: () => void): Promise<RpcConnection> {
     if (this.stopped) throw new Error('HermesHeadless was stopped')
     const generation = ++this.connectGeneration
     this.emit('connection', { kind: 'connecting' } satisfies HermesConnectionState)
@@ -486,6 +744,7 @@ export class HermesHeadless extends EventEmitter {
       socket.close(1000, 'superseded')
       throw new Error('HermesHeadless connect was cancelled')
     }
+    onDialed?.()
     const connection = await RpcConnection.open(socket, {
       canAnswer: isAnswerableRequest,
       watermarks: this.watermarks,
@@ -497,7 +756,10 @@ export class HermesHeadless extends EventEmitter {
       throw new Error('HermesHeadless connect was cancelled')
     }
     this.connection = connection
-    connection.on('event', (event) => this.reconciler.applyEvent(event))
+    connection.on('event', (event) => {
+      if (event.type === 'sessions.changed') this.onSessionsChanged()
+      this.reconciler.applyEvent(event)
+    })
     connection.on('request', (request: ServerRequest) => this.reconciler.openRequest(request as OpenRequestEntry & { replayed: boolean }))
     connection.on('unknown', (shape) => this.emit('unknown', { eventType: 'frame', reason: String((shape as { reason?: string }).reason) }))
     connection.on('close', (info: { code: number; reason: string }) => {
@@ -514,25 +776,245 @@ export class HermesHeadless extends EventEmitter {
    * so the durable channel owns what the live turn painted. One fetch at a
    * time: a second settle while one is in flight re-runs it once afterwards.
    */
-  private scheduleHistoryFetch(): void {
+  private scheduleHistoryFetch(): Promise<void> {
     if (this.historyFetch) {
-      void this.historyFetch.then(() => this.scheduleHistoryFetch())
-      return
+      return this.historyFetch.then(() => this.scheduleHistoryFetch())
     }
     const runtime = this.reconciler.currentRuntimeSessionId
     const connection = this.connection
-    if (!runtime || !connection?.isOpen) return
-    this.historyFetch = connection
+    if (!runtime || !connection?.isOpen) return Promise.resolve()
+    const fetch = connection
       .call<SessionHistoryResult>('session.history', { session_id: runtime })
       // Only for the conversation it was asked about: a reply that lands
       // after `/new` must not commit the old rows into the new one.
       .then((result) => {
-        if (this.reconciler.currentRuntimeSessionId === runtime) this.reconciler.applyHistory(result.messages ?? [])
+        if (this.reconciler.currentRuntimeSessionId !== runtime) return
+        const messages = result.messages ?? []
+        this.lastHistory = messages
+        this.reconciler.applyHistory(messages)
       })
       .catch((error: unknown) => this.committed.publishError(error instanceof Error ? error : new Error(String(error))))
       .finally(() => {
         this.historyFetch = null
       })
+    this.historyFetch = fetch
+    return fetch
+  }
+
+  // ── Telegram lane ──────────────────────────────────────────────────────────
+
+  /** The lane's stored conversation right now, following compression; null when the lane has none. */
+  private async resolveLaneTip(): Promise<string | null> {
+    const target = this.options.target
+    if (target.mode !== 'lane' || !this.options.rest) return null
+    // The platform is the key's third field (`agent:<profile>:<platform>:…`,
+    // gateway/session.py build_session_key); scoping the listing to it keeps
+    // the page small enough that the lane is always on it.
+    const platform = target.sessionKey.split(':')[2] || undefined
+    const listing = await this.options.rest.listSessions({ source: platform, order: 'recent', limit: 100, profile: target.profile })
+    const head = pickLaneRow(listing.sessions, target.sessionKey)
+    if (!head) return null
+    const tip = await this.options.rest.latestDescendant(head.id, target.profile)
+    return tip.session_id || head.id
+  }
+
+  /**
+   * Re-resolve the lane and refresh the transcript. Single flight; a call
+   * that arrives while one runs makes it run once more afterwards, so the
+   * LAST signal is always reflected.
+   */
+  /** Resolves true when the LAST pass resolved the tip and read history; false when it failed. */
+  private refreshLane(): Promise<boolean> {
+    if (this.options.target.mode !== 'lane' || this.stopped) return Promise.resolve(false)
+    if (this.laneRefresh) {
+      this.laneRefreshAgain = true
+      return this.laneRefresh
+    }
+    const run = (async () => {
+      let ok = false
+      do {
+        this.laneRefreshAgain = false
+        try {
+          await this.refreshLaneOnce()
+          ok = true
+        } catch (error) {
+          ok = false
+          this.emit('lane-error', error instanceof Error ? error : new Error(String(error)))
+        }
+      } while (this.laneRefreshAgain && !this.stopped)
+      return ok
+    })().finally(() => {
+      this.laneRefresh = null
+    })
+    this.laneRefresh = run
+    return run
+  }
+
+  private async refreshLaneOnce(): Promise<void> {
+    const connection = this.connection
+    if (!connection?.isOpen) throw new Error('Hermes is not connected')
+    const tip = await this.resolveLaneTip()
+    if (!tip) throw new Error('The Telegram thread has no live conversation right now')
+    const current = this.reconciler.currentStoredSessionId
+    if (current && tip !== current) {
+      const reason = await this.laneMoveReason(current, tip)
+      await this.attachByResume(connection, tip, reason === 'new-conversation' ? 'new-conversation' : 'snapshot')
+      this.ownUserRowIds.clear()
+      // After the move succeeded: a failed re-resume used to announce the
+      // move anyway, and the retry announced it again (review).
+      this.emit('lane-moved', { from: current, to: tip, reason } satisfies LaneMove)
+    }
+    await this.scheduleHistoryFetch()
+    this.evaluateLane(true)
+  }
+
+  /** Compression keeps the conversation (seamless); anything else is a different one. */
+  private async laneMoveReason(from: string, to: string): Promise<LaneMove['reason']> {
+    try {
+      const descendant = await this.options.rest!.latestDescendant(from, this.options.target.mode === 'lane' ? this.options.target.profile : undefined)
+      return descendant.session_id === to ? 'compression' : 'new-conversation'
+    } catch {
+      return 'new-conversation'
+    }
+  }
+
+  /**
+   * `tipFresh`: called at the end of a lane refresh, i.e. the stored id was
+   * just re-resolved. Only then may held prompts be sent (§6.2: before EVERY
+   * submit); from any other trigger (our turn settling, a lease status) a
+   * refresh runs first and comes back here with `tipFresh` (review).
+   */
+  private evaluateLane(tipFresh = false): void {
+    if (this.options.target.mode !== 'lane') return
+    const tail: LaneTail | null = laneTail(this.lastHistory ?? [])
+    const now = this.now()
+    if (tail?.key !== this.laneTailSeen?.key) {
+      // Seeded from the row's own age when Hermes stamped it, so a pane
+      // opened on a phone turn that died hours ago does not hold prompts for
+      // another 5 minutes (review). A minute of slack for clock skew between
+      // this Mac and the server.
+      const rowAgeMs = tail?.timestamp ? Math.max(0, now - tail.timestamp * 1000 - 60_000) : 0
+      this.laneTailSeen = tail ? { key: tail.key, since: now - rowAgeMs } : null
+    }
+    const stale = this.laneTailSeen !== null && now - this.laneTailSeen.since > STALE_BUSY_TAIL_MS
+    // Our OWN running turn is never "the phone is busy": Hermes' turn lease
+    // orders a phone message behind it, and our later prompts go with
+    // `queued: true`. But our turn WAITING on the lease means the phone holds
+    // the conversation right now (noteLeaseStatus).
+    const busy = this.leaseWait || (!this.turnInFlight && !stale && isTailBusy(tail, this.ownUserRowIds))
+    const changed = busy !== this.laneBusy
+    this.laneBusy = busy
+    if (changed) this.emitLane()
+    if (!busy && this.held.length > 0) {
+      if (tipFresh) void this.drainHeld()
+      else void this.refreshLane()
+    }
+  }
+
+  private async drainHeld(): Promise<void> {
+    if (this.draining) return
+    this.draining = true
+    try {
+      while (this.held.length > 0 && !this.laneBusy && !this.stopped) {
+        const hold = this.held.shift()!
+        this.emitLane()
+        try {
+          const outcome = await this.submit(hold.text)
+          this.emit('hold-released', { holdId: hold.id, outcome })
+        } catch (error) {
+          this.emit('hold-failed', { holdId: hold.id, text: hold.text, error: error instanceof Error ? error : new Error(String(error)) })
+        }
+      }
+    } finally {
+      this.draining = false
+    }
+  }
+
+  /** "Send now": submit a held prompt despite the busy lane (the user accepts the T4 framing risk). */
+  async releaseHeld(holdId: string): Promise<PromptOutcome | null> {
+    if (!this.held.some((hold) => hold.id === holdId)) return null
+    // "Send now" overrides BUSY, never the tip check: it must still go to the
+    // thread's live conversation (§6.2, review).
+    if (!(await this.refreshLane())) throw new HermesPromptError('not-ready', 'Could not confirm the Telegram thread; try again in a moment.')
+    const index = this.held.findIndex((hold) => hold.id === holdId)
+    if (index < 0) return null
+    const [hold] = this.held.splice(index, 1)
+    this.emitLane()
+    const outcome = await this.submit(hold!.text)
+    this.emit('hold-released', { holdId, outcome })
+    return outcome
+  }
+
+  /** Drop a held prompt; returns its text so the consumer can put it back in the composer. */
+  cancelHeld(holdId: string): string | null {
+    const index = this.held.findIndex((hold) => hold.id === holdId)
+    if (index < 0) return null
+    const [hold] = this.held.splice(index, 1)
+    this.emitLane()
+    return hold!.text
+  }
+
+  get laneState(): HermesLaneState | null {
+    const target = this.options.target
+    if (target.mode !== 'lane') return null
+    return {
+      sessionKey: target.sessionKey,
+      storedSessionId: this.reconciler.currentStoredSessionId || null,
+      busy: this.laneBusy,
+      held: this.held.map((hold) => ({ ...hold })),
+    }
+  }
+
+  /** Pause the backstop poll while nobody can see the pane; `sessions.changed` still refreshes. */
+  setLanePollingPaused(paused: boolean): void {
+    this.lanePollingPaused = paused
+    if (!paused) void this.refreshLane()
+  }
+
+  private noteLeaseStatus(status: string | null): void {
+    if (!status || this.options.target.mode !== 'lane') return
+    const waiting = /another hermes process is using this session/i.test(status)
+    const free = /^session is free/i.test(status.trim())
+    if (!waiting && !free) return
+    this.leaseWait = waiting
+    this.evaluateLane()
+  }
+
+  private emitLane(): void {
+    const state = this.laneState
+    if (state) this.emit('lane', state)
+  }
+
+  private onSessionsChanged(): void {
+    if (this.options.target.mode !== 'lane') return
+    // The signal is GLOBAL and payload-free (change_watcher.py): any session
+    // on the server changed. Debounced, then one refresh decides whether it
+    // was ours.
+    if (this.laneDebounce) clearTimeout(this.laneDebounce)
+    this.laneDebounce = setTimeout(() => {
+      this.laneDebounce = null
+      void this.refreshLane()
+    }, this.options.laneDebounceMs ?? 300)
+  }
+
+  private startLaneBackstop(): void {
+    if (this.laneBackstop || this.options.target.mode !== 'lane') return
+    this.laneBackstop = setInterval(() => {
+      if (!this.lanePollingPaused) void this.refreshLane()
+    }, this.options.laneBackstopMs ?? 30_000)
+    // Never keep a Node process alive just to poll.
+    ;(this.laneBackstop as { unref?: () => void }).unref?.()
+  }
+
+  /** Lanes a pane could follow on this server (Settings / "Change Telegram Thread…"). */
+  static async listLanes(rest: HermesRest, profile?: string): Promise<LaneSummary[]> {
+    const listing = await rest.listSessions({ order: 'recent', limit: 100, profile })
+    return summarizeLanes(listing.sessions)
+  }
+
+  /** The lane a new "Telegram thread" pane opens (plan Decision 2). */
+  static async defaultLane(rest: HermesRest, profile?: string): Promise<LaneSummary | null> {
+    return defaultTelegramLane(await HermesHeadless.listLanes(rest, profile))
   }
 }
 
@@ -564,4 +1046,15 @@ function openTurnStart(events: Array<Record<string, unknown>>, sessionId: string
     if (event.type === 'message.complete') start = null
   }
   return start
+}
+
+/** One line for `/compress`'s result (SessionCompressResult; open shape under turn isolation). */
+function compressSummary(result: Record<string, unknown>): string {
+  if (result.status === 'aborted' || result.compressed === false) {
+    return typeof result.message === 'string' && result.message ? result.message : 'Hermes did not compress this conversation.'
+  }
+  const before = typeof result.before_messages === 'number' ? result.before_messages : null
+  const after = typeof result.after_messages === 'number' ? result.after_messages : null
+  if (before !== null && after !== null) return `Compressed the conversation: ${before} → ${after} messages.`
+  return typeof result.message === 'string' && result.message ? result.message : 'Compressed the conversation.'
 }

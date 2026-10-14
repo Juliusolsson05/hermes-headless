@@ -31,6 +31,29 @@ export const HANDLED_EVENTS = [
   'notice',
   'request.cancel',
   'approval.cancelled',
+  // Moved out of IGNORED by agent-code#1497 / plan Stage B (r4 F9 judged
+  // each one): dropping them hid real information from the pane.
+  //  - out-of-band notices: model-switch refusals, provider warnings, "still
+  //    starting the agent" (server.py:995). Silently invisible before.
+  'notification.show',
+  'notification.clear',
+  //  - "Hermes updated its memory/skills" after a turn (server.py:1060).
+  'review.summary',
+  //  - delegate_task children: without these a long delegation was one
+  //    spinner and nothing else. Start/complete only, as activity text.
+  'subagent.start',
+  'subagent.complete',
+  //  - a safety signal on tool output (prompt-injection / secret findings).
+  'tool.output_risk',
+  //  - a connector the turn waits on; Agent Code cannot show the card, but
+  //    it must say where to act, or the turn looks hung.
+  'connection.request',
+  //  - the ANSWERS to /bg and /btw. Lost entirely before (r4 F6).
+  'background.complete',
+  'btw.complete',
+  //  - the cross-process change signal. HermesHeadless (not the reconciler)
+  //    consumes it in Telegram-lane mode to refetch history (plan Stage D).
+  'sessions.changed',
 ] as const
 
 /**
@@ -40,27 +63,20 @@ export const HANDLED_EVENTS = [
  */
 export const IGNORED_EVENTS: Readonly<Record<string, string>> = {
   'skin.changed': 'Hermes theme; Agent Code has its own',
-  'sessions.changed': 'change signal for a session list we do not mirror',
   'cron.changed': 'change signal',
   'platforms.changed': 'change signal',
   'projects.changed': 'change signal',
   'pairing.changed': 'change signal',
   'bot_relay.outbox.pending': 'bot-to-bot relay (Bot Mode), out of scope',
-  'notification.show': 'Desktop toast; the reconciler surfaces turn errors itself',
-  'notification.clear': 'Desktop toast',
   'tip.show': 'Desktop onboarding bubble',
   'pane.reveal': 'Desktop pane control',
   'preview.open': 'Desktop preview pane',
   'preview.close': 'Desktop preview pane',
   'todo.updated': 'todo panel, out of scope v1',
-  'tool.output_risk': 'risk badge, out of scope v1',
   'reaction': 'affection reaction',
   'message.reaction': 'agent reaction to a message',
-  'review.summary': 'background review',
   'session.control.update': 'goal/loop/heartbeat controls',
   'session.resume_progress': 'deferred hydration progress (we never defer)',
-  'background.complete': '/background side agent',
-  'btw.complete': '/btw side question',
   'preview.restart.complete': 'Desktop preview restart',
   'preview.restart.progress': 'Desktop preview restart',
   'agent.terminal.output': 'background process output pane',
@@ -84,14 +100,11 @@ export const IGNORED_EVENTS: Readonly<Record<string, string>> = {
   'moa.aggregating': 'mixture-of-agents view',
   'moa.progress': 'mixture-of-agents view',
   'moa.phase': 'mixture-of-agents view',
-  'subagent.spawn_requested': 'subagent roster, out of scope v1',
-  'subagent.start': 'subagent roster',
+  'subagent.spawn_requested': 'subagent roster; start/complete are handled as activity',
   'subagent.progress': 'subagent roster',
   'subagent.thinking': 'subagent roster',
   'subagent.tool': 'subagent roster',
-  'subagent.complete': 'subagent roster',
-  'connection.request': 'connector operation cards, out of scope v1',
-  'connection.update': 'connector operation cards',
+  'connection.update': 'connector operation cards (the request itself becomes a notice)',
   'display.status': 'remote display',
   'display.lease': 'remote display',
   'display.install.log': 'remote display',

@@ -78,9 +78,67 @@ export type ReconcilerOutput = {
    */
   reclaimed(reason: string): void
   unknown(shape: { eventType: string; reason: string }): void
+  /**
+   * Something the user should read that is not part of the conversation:
+   * Hermes' out-of-band notifications, the background memory/skill review,
+   * a risky tool output, a connector the turn waits on. Before
+   * agent-code#1497 every one of these was dropped silently (r4 F9).
+   */
+  notice(notice: HermesNotice): void
+  /** A keyed `notification.show` was withdrawn. */
+  noticeCleared(key: string): void
+  /**
+   * The answer to `/bg` or `/btw`. NOT a turn: `/btw` is answered "from a
+   * snapshot … history, alternation and prompt cache stay untouched"
+   * (methods_prompt.py), and `/bg` runs in its own session. The consumer
+   * shows it beside the conversation, never as an assistant reply.
+   */
+  sideAnswer(answer: HermesSideAnswer): void
 }
 
-type Block = { index: number; kind: 'text' | 'thinking' | 'tool_use'; text: string; toolUseId?: string }
+/**
+ * Tool results observed LIVE, by tool call id. Hermes' history projection
+ * drops tool output (recorded S4), so this is the only place a committed tool
+ * row gets its output back. A consumer that rebuilds the client for the same
+ * conversation (Reload Agent) passes one cache that outlives it; otherwise a
+ * reload turned every chip into "output is kept on your server" (owner's
+ * debug bundle 2026-10-14T16-26-49: 187 of 206 chips).
+ */
+export type ToolResultCache = {
+  get(toolCallId: string): { content: string; isError: boolean } | undefined
+  set(toolCallId: string, result: { content: string; isError: boolean }): void
+}
+
+export type HermesNotice = {
+  /** Hermes' replace/clear key, or null for a one-off. */
+  key: string | null
+  level: 'info' | 'warn' | 'error' | 'success'
+  /**
+   * Where it came from. `ttl` notices are transient by Hermes' own
+   * definition (the consumer may show them as status text); every other
+   * kind stays readable.
+   */
+  kind: 'sticky' | 'ttl' | 'agent' | 'review' | 'tool-risk' | 'connection'
+  text: string
+}
+
+export type HermesSideAnswer = {
+  taskId: string
+  kind: 'background' | 'btw'
+  /** `/btw` echoes its question; `/bg` does not. */
+  question: string | null
+  text: string
+}
+
+type Block = {
+  index: number
+  kind: 'text' | 'thinking' | 'tool_use'
+  text: string
+  toolUseId?: string
+  /** Kept so an open turn can be re-announced after a history reset (replayOpenTurn). */
+  sealed?: boolean
+  tool?: { name: string; args: Record<string, unknown>; context: string | null; result?: { content: string; isError: boolean } }
+}
 
 type LiveTurn = {
   turnId: string
@@ -92,6 +150,8 @@ type LiveTurn = {
   answerText: string
   sawReasoningDelta: boolean
   toolBlocks: Map<string, Block>
+  /** Every block of the turn, in order (replayOpenTurn). */
+  blocks: Block[]
 }
 
 /** Hermes separates a post-tool answer segment with a leading blank line (S6, S8). */
@@ -128,10 +188,14 @@ function toolResultIsError(payload: ToolCompletePayload): boolean {
   return false
 }
 
+function noticeLevel(level: unknown): HermesNotice['level'] {
+  return level === 'warn' || level === 'error' || level === 'success' ? level : 'info'
+}
+
 export class ConversationReconciler {
   private storedSessionId = ''
   /** Results seen live by tool call id; see withLiveToolResult. Cleared per conversation. */
-  private readonly liveToolResults = new Map<string, { content: string; isError: boolean }>()
+  private readonly liveToolResults: ToolResultCache
   private runtimeSessionId = ''
   private title: string | null = null
   private info: SessionLiveInfo | null = null
@@ -143,7 +207,13 @@ export class ConversationReconciler {
   private readonly openRequests = new Set<string>()
   private readonly unknownTypes = new Set<string>()
 
-  constructor(private readonly out: ReconcilerOutput) {}
+  /** True when the consumer owns the cache (it outlives this reconciler; never cleared here). */
+  private readonly sharedResults: boolean
+
+  constructor(private readonly out: ReconcilerOutput, toolResults?: ToolResultCache) {
+    this.liveToolResults = toolResults ?? new Map()
+    this.sharedResults = toolResults !== undefined
+  }
 
   get currentStoredSessionId(): string {
     return this.storedSessionId
@@ -209,9 +279,28 @@ export class ConversationReconciler {
   applyHistory(messages: TranscriptMessage[]): void {
     const ids = messages.map((row) => row.row_id).filter((id): id is number => typeof id === 'number')
     const listed = new Set(ids)
-    const rewritten = this.knownRowIds.some((id) => !listed.has(id))
+    // A rewrite is a known id that VANISHED from the range the listing covers.
+    // WHY the range (owner's debug bundle 2026-10-14T16-26-49): when the
+    // resume snapshot and `session.history` cover different windows of a
+    // long conversation, ids outside the listing's span are simply not in
+    // it; treating them as gone fired a false 'rewrite' reset right after a
+    // reload, which wiped the pane and (through the renderer's reset gate)
+    // silenced the turn that was running.
+    const low = ids.length > 0 ? Math.min(...ids) : Number.POSITIVE_INFINITY
+    const high = ids.length > 0 ? Math.max(...ids) : Number.NEGATIVE_INFINITY
+    const vanishedInside = this.knownRowIds.some((id) => id >= low && id <= high && !listed.has(id))
+    // Compression REPLACES the transcript with rows whose ids are all above
+    // every id the client knows (recorded: T7b in-place compaction
+    // [1..51] → [52..63]; S20 /compress [1..62] → [65..76]). No known id is
+    // inside that span, so it needs its own rule: a listing that shares NO
+    // row with what we hold is a different transcript, not a narrower window
+    // (a narrower window of a growing conversation always holds our newest
+    // rows). Review finding, hermes-headless#2 round 1.
+    const disjoint = ids.length > 0 && this.knownRowIds.length > 0 && !this.knownRowIds.some((id) => listed.has(id))
+    const rewritten = vanishedInside || disjoint
     if (rewritten) {
       this.resetHistory('rewrite', messages)
+      this.replayOpenTurn()
       return
     }
     messages.forEach((row, index) => this.commitRow(row, index))
@@ -306,6 +395,79 @@ export class ConversationReconciler {
       case 'notice':
         this.out.activity({ active: this.turn !== null, status: String((payload as { message?: string }).message ?? '') || null })
         return
+      case 'notification.show': {
+        const shown = payload as { text?: string; level?: string; kind?: string; key?: string | null }
+        const text = String(shown.text ?? '').trim()
+        if (!text) return
+        this.out.notice({
+          key: typeof shown.key === 'string' && shown.key ? shown.key : null,
+          level: noticeLevel(shown.level),
+          kind: shown.kind === 'ttl' || shown.kind === 'agent' ? shown.kind : 'sticky',
+          text,
+        })
+        return
+      }
+      case 'notification.clear': {
+        const key = (payload as { key?: string }).key
+        if (typeof key === 'string' && key) this.out.noticeCleared(key)
+        return
+      }
+      case 'review.summary': {
+        const text = String((payload as { text?: string }).text ?? '').trim()
+        if (text) this.out.notice({ key: null, level: 'info', kind: 'review', text })
+        return
+      }
+      case 'subagent.start': {
+        // Activity only (no roster): the parent turn's tool chip already
+        // shows the delegate_task call; this says what the child is doing.
+        const goal = String((payload as { goal?: string }).goal ?? '').trim()
+        this.out.activity({ active: true, status: goal ? `Delegating: ${goal}` : 'Delegating a task' })
+        return
+      }
+      case 'subagent.complete': {
+        const child = payload as { goal?: string; status?: string }
+        const goal = String(child.goal ?? '').trim()
+        const status = typeof child.status === 'string' && child.status ? child.status : 'finished'
+        this.out.activity({ active: this.turn !== null, status: goal ? `Delegated task ${status}: ${goal}` : `Delegated task ${status}` })
+        return
+      }
+      case 'tool.output_risk': {
+        const risk = payload as { name?: string; risk?: string; findings?: unknown; redacted?: boolean }
+        const findings = Array.isArray(risk.findings) ? risk.findings.filter((f): f is string => typeof f === 'string') : []
+        const what = findings.length > 0 ? `: ${findings.join('; ')}` : ''
+        this.out.notice({
+          key: null,
+          level: 'warn',
+          kind: 'tool-risk',
+          text: `Hermes flagged the output of ${String(risk.name ?? 'a tool')} as ${String(risk.risk ?? 'risky')}${what}${risk.redacted ? ' (redacted)' : ''}.`,
+        })
+        return
+      }
+      case 'connection.request':
+        // The connector card is a Hermes Desktop / dashboard surface. Without
+        // saying so the turn simply looked hung until its deadline.
+        this.out.notice({
+          key: null,
+          level: 'warn',
+          kind: 'connection',
+          text: 'Hermes is waiting for you to connect an account. Finish it in Hermes Desktop or the Hermes dashboard; the turn continues once it is connected.',
+        })
+        return
+      case 'background.complete':
+      case 'btw.complete': {
+        const done = payload as { task_id?: string; text?: string; question?: string | null }
+        this.out.sideAnswer({
+          taskId: String(done.task_id ?? ''),
+          kind: event.type === 'btw.complete' ? 'btw' : 'background',
+          question: typeof done.question === 'string' && done.question ? done.question : null,
+          text: String(done.text ?? ''),
+        })
+        return
+      }
+      case 'sessions.changed':
+        // Consumed by HermesHeadless (Telegram-lane refetch); nothing for the
+        // conversation fold itself.
+        return
       case 'request.cancel': {
         const cancel = payload as RequestCancelPayload
         this.closeRequest(cancel.id, cancel.reason)
@@ -353,7 +515,10 @@ export class ConversationReconciler {
   /** `/new`: the pane keeps its identity, the conversation starts over. */
   beginNewConversation(result: SessionResumeResult & { stored_session_id?: string | null }): void {
     this.knownRowIds = []
-    this.liveToolResults.clear()
+    // A consumer-owned cache is keyed by tool call id, which is unique
+    // across conversations; clearing it would drop results another pane of
+    // the previous conversation (or a later reload of it) still needs.
+    if (!this.sharedResults) (this.liveToolResults as Map<string, unknown>).clear()
     this.applySnapshot(result, 'new-conversation')
   }
 
@@ -394,7 +559,7 @@ export class ConversationReconciler {
   private withLiveToolResult(row: TranscriptMessage): TranscriptMessage {
     if (row.role !== 'tool' || typeof row.tool_call_id !== 'string') return row
     if (row.content !== undefined && row.content !== null && row.content !== '') return row
-    const live = this.liveToolResults.get(row.tool_call_id)
+    const live = this.liveToolResults.get(this.toolResultKey(row.tool_call_id))
     if (!live) return row
     return { ...row, content: live.content, ...(live.isError ? { tool_error: true } : {}) } as TranscriptMessage
   }
@@ -419,6 +584,7 @@ export class ConversationReconciler {
       answerText: '',
       sawReasoningDelta: false,
       toolBlocks: new Map(),
+      blocks: [],
     }
     this.emit({ type: 'turn_started', turnId })
   }
@@ -431,6 +597,7 @@ export class ConversationReconciler {
   private openBlock(kind: Block['kind'], extra: Record<string, unknown> = {}): Block {
     const turn = this.turn!
     const block: Block = { index: turn.nextBlockIndex++, kind, text: '' }
+    turn.blocks.push(block)
     this.emit({ type: 'block_started', turnId: turn.turnId, blockIndex: block.index, kind, ...extra })
     return block
   }
@@ -439,6 +606,7 @@ export class ConversationReconciler {
     const turn = this.turn
     if (!turn?.openText) return
     this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: turn.openText.index, kind: 'text', text: turn.openText.text })
+    turn.openText.sealed = true
     turn.openText = null
   }
 
@@ -446,6 +614,7 @@ export class ConversationReconciler {
     const turn = this.turn
     if (!turn?.openThinking) return
     this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: turn.openThinking.index, kind: 'thinking' })
+    turn.openThinking.sealed = true
     turn.openThinking = null
   }
 
@@ -501,6 +670,8 @@ export class ConversationReconciler {
     const lastSegment = normalizeAnswer(turn.openText?.text ?? '')
     if (normalized === answer || normalized === lastSegment || (answer && answer.endsWith(normalized))) return
     const block = this.openBlock('thinking')
+    block.text = text
+    block.sealed = true
     this.emit({ type: 'thinking_delta', turnId: turn.turnId, blockIndex: block.index, thinkingDelta: text, thinkingSoFar: text })
     this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: block.index, kind: 'thinking' })
   }
@@ -514,6 +685,7 @@ export class ConversationReconciler {
     block.toolUseId = payload.tool_id
     turn.toolBlocks.set(payload.tool_id, block)
     const args = payload.args && typeof payload.args === 'object' ? payload.args : {}
+    block.tool = { name: payload.name, args, context: payload.context ?? null }
     this.emit({
       type: 'tool_input_finalized',
       turnId: turn.turnId,
@@ -542,7 +714,9 @@ export class ConversationReconciler {
         ? payload.summary
         : textOf(payload.result)
     const isError = toolResultIsError(payload)
-    this.liveToolResults.set(payload.tool_id, { content, isError })
+    this.liveToolResults.set(this.toolResultKey(payload.tool_id), { content, isError })
+    const toolBlock = turn.toolBlocks.get(payload.tool_id)
+    if (toolBlock?.tool) toolBlock.tool.result = { content, isError }
     this.emit({
       type: 'tool_result',
       turnId: turn.turnId,
@@ -584,8 +758,76 @@ export class ConversationReconciler {
     })
     this.emit({ type: 'turn_completed', turnId: turn.turnId })
     this.turn = null
+    // Every answerable request blocks the agent thread, so once the turn has
+    // ended nothing can still be waiting on one. Hermes emits NOTHING to the
+    // other attached clients when one of them answers (server_requests.py
+    // resolve_response, r4 F4), so a card answered in Hermes Desktop or
+    // Telegram stayed up here and silently swallowed the next click
+    // (recorded S22). Closing at turn end is the earliest point that is
+    // provably safe; closing on the next stream frame was considered and
+    // rejected because a spinner frame can arrive while a clarify is open.
+    this.closeAllRequests('settled')
     this.out.activity({ active: false, status: null })
     this.out.turnSettled({ persisted: payload.persisted_turn ?? null, status })
+  }
+
+  /**
+   * Tool call ids are NOT unique across conversations: recorded S5 (v0.22.0)
+   * has `call_approval_0_0` in two conversations, one ran and one was denied.
+   * A consumer-shared cache keyed by call id alone showed one conversation's
+   * output in the other (review finding, both reviewers). Keyed by the
+   * STORED id, which survives a client rebuild (the cache's reason to exist);
+   * a rotating compression changes it, which only costs re-fetching outputs.
+   */
+  private toolResultKey(toolCallId: string): string {
+    return `${this.storedSessionId}:${toolCallId}`
+  }
+
+  /**
+   * Re-announce the running turn after a history reset.
+   *
+   * WHY: the consumer wipes its live turn on every reset and then ignores
+   * every semantic event until a NEW `turn_started` (Agent Code's
+   * historyAwaitingTurnStart gate, useIpcSubscriptions.ts). A reset in the
+   * MIDDLE of a turn therefore silenced it: in the owner's bundle the running
+   * terminal tool never appeared and the pane said "Hermes is thinking" for
+   * the rest of the turn. Replaying what this turn has produced so far, under
+   * the same turn id, reopens the consumer's fold exactly where it was.
+   */
+  private replayOpenTurn(): void {
+    const turn = this.turn
+    if (!turn) return
+    this.emit({ type: 'turn_started', turnId: turn.turnId })
+    for (const block of turn.blocks) {
+      if (block.kind === 'tool_use' && block.tool) {
+        this.emit({ type: 'block_started', turnId: turn.turnId, blockIndex: block.index, kind: 'tool_use', toolName: block.tool.name, toolUseId: block.toolUseId })
+        this.emit({
+          type: 'tool_input_finalized',
+          turnId: turn.turnId,
+          blockIndex: block.index,
+          toolName: block.tool.name,
+          toolUseId: block.toolUseId,
+          inputJson: JSON.stringify(block.tool.args),
+          parsed: block.tool.args,
+          context: block.tool.context,
+        })
+        if (block.tool.result) {
+          this.emit({ type: 'tool_result', turnId: turn.turnId, toolUseId: block.toolUseId, content: block.tool.result.content, isError: block.tool.result.isError, durationSeconds: null, inlineDiff: null })
+        }
+        continue
+      }
+      this.emit({ type: 'block_started', turnId: turn.turnId, blockIndex: block.index, kind: block.kind })
+      if (block.kind === 'text' && block.text) {
+        this.emit({ type: 'text_delta', turnId: turn.turnId, blockIndex: block.index, textDelta: block.text, textSoFar: block.text })
+      }
+      if (block.kind === 'thinking' && block.text) {
+        this.emit({ type: 'thinking_delta', turnId: turn.turnId, blockIndex: block.index, thinkingDelta: block.text, thinkingSoFar: block.text })
+      }
+      if (block.sealed) {
+        this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: block.index, kind: block.kind, ...(block.kind === 'text' ? { text: block.text } : {}) })
+      }
+    }
+    if (turn.answerText) this.emit({ type: 'turn_delta', turnId: turn.turnId, fullText: turn.answerText })
   }
 
   private closeAllRequests(reason: string): void {

@@ -22,7 +22,8 @@ import type { AddressInfo } from 'node:net'
 type ChatMessage = { role: string; content?: unknown; tool_calls?: unknown[] }
 type ToolCall = { name: string; arguments: Record<string, unknown> }
 type Step =
-  | { kind: 'text'; chunks: string[]; delayMs?: number }
+  // `headers`: extra HTTP response headers (S21's credits headers).
+  | { kind: 'text'; chunks: string[]; delayMs?: number; headers?: Record<string, string> }
   | { kind: 'tools'; calls: ToolCall[] }
   | { kind: 'http-error'; status: number; body: unknown }
 
@@ -87,9 +88,82 @@ export const SCENARIOS: Record<string, Step[]> = {
   ],
   // A non-retryable provider failure (S15).
   error: [{ kind: 'http-error', status: 400, body: { error: { message: 'scripted bad request', type: 'invalid_request_error', code: 'scripted_error' } } }],
+  // S21 notification.show / notification.clear. Hermes reads Nous credit
+  // headers off ANY streamed chat response (agent/chat_completion_helpers.py
+  // `_capture_credits`; agent/credits_tracker.py checks no provider), and a
+  // depleted → restored transition is the only notification a scripted
+  // local turn can produce in v0.22.0 (the other emitters are a >30 s agent
+  // build and a dropped mid-turn model switch). Values from upstream's own
+  // tests/agent/test_credits_tracker.py DEPLETED_HEADERS / _base_headers.
+  'credits-out': [{ kind: 'text', chunks: ['Credits', ' depleted.'], delayMs: 30, headers: creditHeaders(false) }],
+  'credits-ok': [{ kind: 'text', chunks: ['Credits', ' restored.'], delayMs: 30, headers: creditHeaders(true) }],
+  // S21 review.summary: `/refine [[hh:review]]` forks a background review
+  // whose last user message carries the marker (agent/background_review.py);
+  // a successful memory write inside the fork is what makes Hermes publish
+  // "💾 Self-improvement review: Memory updated".
+  review: [
+    { kind: 'tools', calls: [{ name: 'memory', arguments: { action: 'add', target: 'memory', content: 'hh scripted fact: the probe colour is blue' } }] },
+    { kind: 'text', chunks: ['Saved.'], delayMs: 30 },
+  ],
+  // S21 memory write in an ordinary turn (only tool.start/tool.complete).
+  memwrite: [
+    { kind: 'tools', calls: [{ name: 'memory', arguments: { action: 'add', target: 'memory', content: 'hh scripted fact: the pane wrote this' } }] },
+    { kind: 'text', chunks: ['Memory', ' written.'], delayMs: 30 },
+  ],
+  // S21 subagent.start / subagent.complete: the child's first user message is
+  // the goal (tools/delegate_tool_child_run.py), so its marker selects
+  // `say-child` and the child answers "ANSWER child".
+  delegate: [
+    { kind: 'tools', calls: [{ name: 'delegate_task', arguments: { tasks: [{ goal: '[[hh:say-child]] Say hi from the child.', context: 'none' }] } }] },
+    { kind: 'text', chunks: ['Dispatched.'], delayMs: 30 },
+  ],
+}
+
+function creditHeaders(paidAccess: boolean): Record<string, string> {
+  return {
+    'x-nous-credits-version': '1',
+    'x-nous-credits-remaining-micros': '0',
+    'x-nous-credits-remaining-usd': '0.00',
+    'x-nous-credits-subscription-micros': '0',
+    'x-nous-credits-subscription-usd': '0.00',
+    'x-nous-credits-rollover-micros': '0',
+    'x-nous-credits-purchased-micros': '0',
+    'x-nous-credits-purchased-usd': '0.00',
+    'x-nous-tool-pool-micros': '0',
+    'x-nous-tool-pool-gated-off': 'false',
+    'x-nous-credits-denominator-kind': 'none',
+    'x-nous-credits-paid-access': String(paidAccess),
+    'x-nous-credits-as-of-ms': String(Date.now()),
+    ...(paidAccess ? {} : { 'x-nous-credits-disabled-reason': 'out_of_credits' }),
+  }
 }
 
 const MARKER = /\[\[hh:([a-z0-9-]+)\]\]/
+
+/**
+ * Parameterised markers for the lane recordings (research/record-lane.mts)
+ * and the S17+ scenarios, so every phone/pane message gets a reply that
+ * names it without editing the table above per run. (t2 did that by
+ * mutating SCENARIOS from its driver; a stateless rule keeps two concurrent
+ * processes — gateway and serve — on one script by construction.)
+ *
+ * - `say-<label>`: `ANSWER <label>` after 150 ms (a quick turn);
+ * - `slow-<label>`: `ANSWER <label>` after 6 s (long enough to race: the
+ *   pane submits while the phone turn is still in the model call, t2 E);
+ * - `toolslow-<label>`: a terminal tool call (`sleep 2`), then the 6 s answer,
+ *   so the durable tail passes through assistant(tool_calls) and tool rows
+ *   while busy (plan U5: does the busy rule hold with tool-using turns?).
+ *
+ * WHY the answer carries no punctuation or hyphen beyond the label: Telegram
+ * MarkdownV2 escaping turned `-` into `\-` in t2 run2 and broke a text match.
+ */
+function derivedSteps(name: string): Step[] | undefined {
+  const match = /^(say|slow|toolslow)-([a-z0-9-]+)$/.exec(name)
+  if (!match) return undefined
+  const answer: Step = { kind: 'text', chunks: [`ANSWER ${match[2]}`], delayMs: match[1] === 'say' ? 150 : 6000 }
+  if (match[1] !== 'toolslow') return [answer]
+  return [{ kind: 'tools', calls: [{ name: 'terminal', arguments: { command: `sleep 2 && echo hh-${match[2]}` } }] }, answer]
+}
 
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content
@@ -111,7 +185,7 @@ export function selectStep(messages: ChatMessage[]): { scenario: string; step: S
   if (lastUser < 0) return null
   const match = MARKER.exec(textOf(messages[lastUser].content))
   if (!match) return null
-  const steps = SCENARIOS[match[1]]
+  const steps = SCENARIOS[match[1]] ?? derivedSteps(match[1])
   if (!steps) return null
   const assistantTurns = messages.slice(lastUser + 1).filter((message) => message.role === 'assistant').length
   const index = Math.min(assistantTurns, steps.length - 1)
@@ -134,8 +208,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 export type ScriptedModelServer = {
   url: string
   port: number
-  /** Every request body received, for assertions on what Hermes sent. */
-  requests: Array<{ path: string; body: unknown }>
+  /**
+   * Every request body received, for assertions on what Hermes sent.
+   * `startedAt`/`finishedAt` (epoch ms; finishedAt 0 until the response
+   * ends) are the ground truth for "was a model turn running at time t" in
+   * the lane recordings (plan H3), carried over from t2's scratch copy.
+   */
+  requests: Array<{ path: string; body: unknown; startedAt: number; finishedAt: number }>
   close(): Promise<void>
 }
 
@@ -153,7 +232,11 @@ export async function startScriptedModel(port = 0, model = 'scripted-1'): Promis
 
   async function handle(path: string, raw: string, res: http.ServerResponse): Promise<void> {
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : null
-    requests.push({ path, body })
+    const record = { path, body, startedAt: Date.now(), finishedAt: 0 }
+    requests.push(record)
+    res.on('finish', () => {
+      record.finishedAt = Date.now()
+    })
     if (/\/v1\/models(\/|$)/.test(path)) {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ object: 'list', data: [{ id: model, object: 'model', owned_by: 'scripted' }] }))
@@ -177,6 +260,10 @@ export async function startScriptedModel(port = 0, model = 'scripted-1'): Promis
     }
     if (!body.stream) {
       const content = step.kind === 'text' ? step.chunks.join('') : ''
+      // Some callers (the gateway, auxiliary clients) may ask for a
+      // non-streaming completion. Keep the scripted latency so a race that
+      // depends on "the model call is still running" holds either way (t2).
+      if (selected && step.kind === 'text' && step.delayMs) await sleep(step.chunks.length * step.delayMs)
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
         id: 'chatcmpl-scripted',
@@ -188,7 +275,7 @@ export async function startScriptedModel(port = 0, model = 'scripted-1'): Promis
       }))
       return
     }
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...(step.kind === 'text' ? step.headers : undefined) })
     if (step.kind === 'text') {
       for (const [index, text] of step.chunks.entries()) {
         if (res.destroyed) return

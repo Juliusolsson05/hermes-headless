@@ -9,6 +9,7 @@ import {
   HermesAuthError,
   buildAuthorizeUrl,
   buildWsUrl,
+  wsTicketProtocols,
   createPkce,
   endpoint,
   exchangeCode,
@@ -179,8 +180,10 @@ describe('URLs', () => {
   })
 
   it('builds wss for https and keeps the prefix in the socket URL', () => {
-    expect(buildWsUrl('https://vps.example/hermes', 'a b')).toBe('wss://vps.example/hermes/api/ws?ticket=a%20b')
-    expect(buildWsUrl('http://127.0.0.1:9119', 't')).toBe('ws://127.0.0.1:9119/api/ws?ticket=t')
+    // No ticket in the URL: proxies log request URIs (r5). The ticket is a subprotocol.
+    expect(buildWsUrl('https://vps.example/hermes')).toBe('wss://vps.example/hermes/api/ws')
+    expect(buildWsUrl('http://127.0.0.1:9119')).toBe('ws://127.0.0.1:9119/api/ws')
+    expect(wsTicketProtocols('t-1')).toEqual(['hermes-gateway-v1', 'hermes-gateway-ticket.t-1'])
   })
 
   it('derives the challenge as S256 of the verifier (what Hermes checks at /auth/native/token)', async () => {
@@ -198,5 +201,21 @@ describe('URLs', () => {
     expect(url.searchParams.get('code_challenge_method')).toBe('S256')
     expect(readAuthorizationCode(`http://127.0.0.1:5000/cb?code=abc&state=${pkce.state}`, pkce.state)).toBe('abc')
     expect(() => readAuthorizationCode('http://127.0.0.1:5000/cb?code=abc&state=forged', pkce.state)).toThrow(/state/)
+  })
+})
+
+describe('HTTP deadline (owner bundle 2026-10-14T16-26-49)', () => {
+  it('turns a request that never answers into a transport ETIMEDOUT instead of hanging', async () => {
+    const { mintWsTicket: mint, HTTP_TIMEOUT_MS: limit } = await import('./index.js')
+    expect(limit).toBe(20_000)
+    // A fetch that only settles when its signal aborts: the shape of a
+    // half-open route. The deadline is shortened through the signal itself.
+    const hanging = (_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      expect(signal).toBeDefined()
+      signal!.addEventListener('abort', () => reject(Object.assign(new Error('timed out'), { name: 'TimeoutError' })))
+      setTimeout(() => (signal as AbortSignal & { dispatchEvent(e: Event): boolean }).dispatchEvent(new Event('abort')), 10)
+    })
+    await expect(mint({ baseUrl: 'https://vps.example', accessToken: 'a' }, hanging)).rejects.toMatchObject({ kind: 'transport', causeCode: 'ETIMEDOUT' })
   })
 })
