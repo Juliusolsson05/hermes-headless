@@ -20,7 +20,11 @@ export type BackendCompatibility =
   | { kind: 'unsupported'; contract: number | null }
 
 export function backendCompatibility(desktopContract: unknown): BackendCompatibility {
-  const contract = typeof desktopContract === 'number' ? desktopContract : Number(desktopContract)
+  // `Number(null)` and `Number('')` are 0: a backend that reported NOTHING
+  // must read as "no contract", not as contract 0.
+  const contract = typeof desktopContract === 'number'
+    ? desktopContract
+    : typeof desktopContract === 'string' && desktopContract.trim() !== '' ? Number(desktopContract) : Number.NaN
   if (!Number.isFinite(contract)) return { kind: 'unsupported', contract: null }
   if (contract < MIN_DESKTOP_CONTRACT) return { kind: 'unsupported', contract }
   if (contract === TESTED_DESKTOP_CONTRACT) return { kind: 'tested', contract }

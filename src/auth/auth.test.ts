@@ -173,6 +173,14 @@ describe('URLs', () => {
     expect(buildWsUrl('http://127.0.0.1:9119', 't')).toBe('ws://127.0.0.1:9119/api/ws?ticket=t')
   })
 
+  it('derives the challenge as S256 of the verifier (what Hermes checks at /auth/native/token)', async () => {
+    const { createHash } = await import('node:crypto')
+    const pkce = createPkce()
+    const expected = createHash('sha256').update(pkce.verifier).digest('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(pkce.challenge).toBe(expected)
+    expect(pkce.challenge).not.toBe(pkce.verifier)
+  })
+
   it('builds the S256 authorize URL and checks state on the way back', () => {
     const pkce = createPkce()
     const url = new URL(buildAuthorizeUrl({ baseUrl: base, codeChallenge: pkce.challenge, redirectUri: 'http://127.0.0.1:5000/cb', state: pkce.state }))

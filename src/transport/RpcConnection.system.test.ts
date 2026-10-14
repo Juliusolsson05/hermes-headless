@@ -187,3 +187,55 @@ describe('closing', () => {
     await expect(pending).rejects.toMatchObject({ name: 'ConnectionClosedError', method: 'prompt.submit', code: 1006 })
   })
 })
+
+describe('heartbeat (package review B survivor)', () => {
+  it('closes a socket that has been silent past the deadline, and keeps one that streams', async () => {
+    // A fake clock with real clearTimer semantics: the ready timeout and
+    // per-call timeouts must be cancellable, or they fire and close the socket.
+    const timers = new Map<number, { fn: () => void; at: number }>()
+    let nextHandle = 1
+    let now = 0
+    const realNow = Date.now
+    Date.now = () => now
+    try {
+      const socket = new FakeSocket()
+      const opening = RpcConnection.open(socket, {
+        canAnswer: () => true,
+        watermarks: new Map(),
+        heartbeatIntervalMs: 15_000,
+        heartbeatDeadlineMs: 45_000,
+        setTimer: (fn, ms) => {
+          const handle = nextHandle++
+          timers.set(handle, { fn, at: now + ms })
+          return handle
+        },
+        clearTimer: (handle) => {
+          timers.delete(handle as number)
+        },
+      })
+      socket.push(READY_FRAME())
+      await socket.answerCall('client.capabilities', CAPABILITIES)
+      const connection = await opening
+      const advance = (ms: number) => {
+        now += ms
+        for (const [handle, timer] of [...timers.entries()].filter(([, entry]) => entry.at <= now)) {
+          timers.delete(handle)
+          timer.fn()
+        }
+      }
+      advance(15_000)
+      advance(15_000)
+      // Any inbound frame is liveness (Hermes' own client): a streaming turn
+      // keeps the socket alive even without pong replies.
+      socket.push({ jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', payload: {} } })
+      advance(15_000)
+      expect(connection.isOpen).toBe(true)
+      advance(15_000)
+      advance(15_000)
+      advance(15_000)
+      expect(connection.isOpen).toBe(false)
+    } finally {
+      Date.now = realNow
+    }
+  })
+})

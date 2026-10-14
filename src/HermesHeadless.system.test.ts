@@ -279,3 +279,97 @@ describe('after a turn and on stop', () => {
     expect(socket.sent.some((frame) => frame.method === 'session.close')).toBe(false)
   })
 })
+
+/** A started create-mode harness on recorded S3, for the command tests below. */
+async function started(): Promise<{ h: Harness; socket: FakeSocket; sid: string; created: Record<string, unknown>; events: Array<Record<string, unknown>>; frames: Array<Record<string, unknown>> }> {
+  const { sid, events, frames } = sessionEvents('S3')
+  const created = firstResult(frames, (result) => result.session_id === sid && result.message_count === 0)
+  const h = harness({ mode: 'create', source: 'agent-code' })
+  const starting = h.headless.start()
+  const socket = await h.nextSocket()
+  await handshake(socket)
+  await socket.answerCall('session.create', created)
+  await socket.answerCall('session.events.since', ring([]))
+  await starting
+  return { h, socket, sid, created, events, frames }
+}
+
+describe('commands (package review B #2 survivors)', () => {
+  it('falls back to a new conversation when the stored id is gone (4007), and says so', async () => {
+    const { frames, sid } = sessionEvents('S3')
+    const created = firstResult(frames, (result) => result.session_id === sid && result.message_count === 0)
+    const h = harness({ mode: 'resume', storedSessionId: 'deleted-conversation' })
+    const replaced: unknown[] = []
+    h.headless.on('session-replaced', (event: unknown) => replaced.push(event))
+    const starting = h.headless.start()
+    const socket = await h.nextSocket()
+    await handshake(socket)
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push({ jsonrpc: '2.0', id: resume.id, error: { code: 4007, message: 'session not found' } })
+    await socket.answerCall('session.create', created)
+    await socket.answerCall('session.events.since', ring([]))
+    await starting
+    expect(replaced).toEqual([{ previousStoredSessionId: 'deleted-conversation', reason: 'not-found' }])
+    expect(h.headless.storedSessionId).toBe(created.stored_session_id)
+  })
+
+  it('/new closes the old runtime, creates a new one and resets history; a late history reply for the old one is dropped', async () => {
+    const { h, socket, sid, events } = await started()
+    const boundaries: Array<{ type: string; reason?: string }> = []
+    const rows: string[] = []
+    h.headless.committed.on('boundary', (boundary: { type: string; reason?: string }) => boundaries.push(boundary))
+    h.headless.committed.on('entry', (row: { storedSessionId: string }) => rows.push(row.storedSessionId))
+    const firstComplete = events.findIndex((event) => event.type === 'message.complete')
+    for (const event of events.slice(0, firstComplete + 1)) socket.push(eventFrame(event))
+    const history = await socket.nextSent((frame) => frame.method === 'session.history')
+    const renewing = h.headless.runSlash('/new')
+    await socket.answerCall('session.close', { closed: true, messages: [] })
+    await socket.answerCall('session.create', { session_id: 'newrt001', stored_session_id: 'new-stored', message_count: 0, messages: [], info: {} })
+    await socket.answerCall('session.events.since', ring([]))
+    expect(await renewing).toEqual({ kind: 'new-conversation' })
+    // The old conversation's history reply arrives only now (review B #1).
+    socket.push({ jsonrpc: '2.0', id: history.id, result: { count: 2, messages: [{ role: 'user', text: 'hi', row_id: 1 }, { role: 'assistant', text: 'old', row_id: 2 }] } })
+    await flush()
+    expect(socket.sent.find((frame) => frame.method === 'session.close')?.params).toEqual({ session_id: sid })
+    expect(boundaries.some((boundary) => boundary.type === 'reset' && boundary.reason === 'new-conversation')).toBe(true)
+    expect(rows.filter((stored) => stored === 'new-stored')).toEqual([])
+  })
+
+  it('closes an answered card locally without waiting for the server', async () => {
+    const { h, socket } = await started()
+    const approval = inboundFrames(latestRecording('S5')).find((frame) => frame.method === 'approval')!
+    socket.push(approval)
+    await h.headless.answerRequest(String(approval.id), { choice: 'once' })
+    expect(h.closed).toEqual([String(approval.id)])
+  })
+
+  it('routes a skill command through command.dispatch and submits its expansion (recorded S13)', async () => {
+    const { h, socket } = await started()
+    const s13 = inboundFrames(latestRecording('S13'))
+    const dispatched = s13.map((frame) => frame.result as Record<string, unknown> | undefined).find((result) => result?.type === 'skill')!
+    const running = h.headless.runSlash('/hh-secret')
+    const exec = await socket.nextSent((frame) => frame.method === 'slash.exec')
+    socket.push({ jsonrpc: '2.0', id: exec.id, error: { code: 4018, message: 'skill command: use command.dispatch for /hh-secret' } })
+    await socket.answerCall('command.dispatch', dispatched)
+    const submit = await socket.nextSent((frame) => frame.method === 'prompt.submit')
+    socket.push({ jsonrpc: '2.0', id: submit.id, result: { status: 'streaming', user_row_id: 3 } })
+    expect(await running).toMatchObject({ kind: 'prompt' })
+    expect((submit.params as { text: string }).text).toBe(dispatched.message)
+  })
+
+  it('re-snapshots by stored id when the reconnect ring is truncated (mechanical mutation of S8)', async () => {
+    const { h, socket, created } = await started()
+    socket.close(4000, 'drop')
+    const reconnecting = h.headless.reconnect()
+    const second = await h.nextSocket()
+    await handshake(second)
+    await second.answerCall('session.activate', created)
+    await second.answerCall('session.events.since', ring([], { truncated: true, latest_seq: 700 }))
+    const resume = await second.nextSent((frame) => frame.method === 'session.resume')
+    expect((resume.params as { session_id: string }).session_id).toBe(created.stored_session_id)
+    second.push({ jsonrpc: '2.0', id: resume.id, result: created })
+    await second.answerCall('session.events.since', ring([], { latest_seq: 700 }))
+    await second.answerCall('session.history', { count: 0, messages: [] })
+    await reconnecting
+  })
+})

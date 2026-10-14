@@ -296,3 +296,49 @@ describe('reconciler guards (survivors from package review A)', () => {
     expect(sessions.at(-1)).toBe('tip-after-compression')
   })
 })
+
+describe('durable row identity and tool fallbacks (package review B #3, recorded S4)', () => {
+  it('keys user/assistant rows by row_id and tool rows by tool_call_id, as projected', () => {
+    const entries = latestRecording('S4')
+    const [created] = createdSessions(entries)
+    const resumed = inboundFrames(entries).map((frame) => frame.result as Record<string, unknown> | undefined)
+      .filter((result) => Array.isArray(result?.messages) && (result!.messages as unknown[]).length > 0).at(-1) as unknown as SessionResumeResult
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(created.result, 'snapshot')
+    reconciler.applySnapshot(resumed, 'snapshot', { seedInflight: false })
+    expect(got.committed.map((row) => row.key)).toEqual(['row:1', 'tool:call_tools_0_0', 'tool:call_tools_0_1', 'tool:call_tools_1_0', 'row:7'])
+  })
+
+  it('opens a chip for a tool.complete whose tool.start it never saw (resume mid-tool)', () => {
+    const entries = latestRecording('S4')
+    const [session] = createdSessions(entries)
+    const complete = sessionEvents(entries, session.sid).find((event) => event.type === 'tool.complete')!
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(session.result, 'snapshot')
+    reconciler.applyEvent({ type: 'message.start', session_id: session.sid, seq: 1 })
+    reconciler.applyEvent(complete)
+    const toolId = (complete.payload as { tool_id: string }).tool_id
+    expect(got.semantic.find((event) => event.type === 'block_started' && event.toolUseId === toolId)).toBeDefined()
+    expect(got.semantic.find((event) => event.type === 'tool_result' && event.toolUseId === toolId)).toBeDefined()
+  })
+
+  it('seals a text segment with block_completed when a tool interrupts it', () => {
+    const entries = latestRecording('S6')
+    const [session] = createdSessions(entries)
+    const got = foldSession(entries, session)
+    const textBlocks = new Set(got.semantic.filter((event) => event.type === 'block_started' && event.kind === 'text').map((event) => event.blockIndex))
+    const sealed = new Set(got.semantic.filter((event) => event.type === 'block_completed' && event.kind === 'text').map((event) => event.blockIndex))
+    expect([...textBlocks].every((index) => sealed.has(index))).toBe(true)
+  })
+
+  it('treats `success: false` as a failed tool (justified literal: the documented result flag, 0 occurrences in the corpus)', () => {
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applyEvent({ type: 'message.start', seq: 1 })
+    reconciler.applyEvent({ type: 'tool.start', seq: 2, payload: { tool_id: 't1', name: 'web_search', args: {} } })
+    reconciler.applyEvent({ type: 'tool.complete', seq: 3, payload: { tool_id: 't1', name: 'web_search', result: { success: false } } })
+    expect(got.semantic.find((event) => event.type === 'tool_result')?.isError).toBe(true)
+  })
+})
