@@ -191,6 +191,16 @@ export class HermesHeadless extends EventEmitter {
   private laneBackstop: ReturnType<typeof setInterval> | null = null
   private lanePollingPaused = false
   private readonly now: () => number
+  /**
+   * Our turn is waiting on Hermes' cross-process turn lease, i.e. ANOTHER
+   * surface (the phone) holds the conversation. Plan H3, refined by Stage 0:
+   * in the recorded phone-first race (T4) the tail rule read "idle" for ~5 s
+   * because the tail was our own just-submitted row, while the phone turn
+   * was still running; the lease status is the signal that covers it. Set by
+   * "Another Hermes process is using this session", cleared by "Session is
+   * free" (both recorded, T4:69/79) or by our turn settling.
+   */
+  private leaseWait = false
 
   constructor(private readonly options: HermesHeadlessOptions) {
     super()
@@ -203,7 +213,10 @@ export class HermesHeadless extends EventEmitter {
       committed: (row) => this.committed.publishRow(row),
       historyReset: (generation, reason) => this.committed.publishBoundary({ type: 'reset', generation, reason }),
       historyCaughtUp: (generation) => this.committed.publishBoundary({ type: 'caught-up', generation }),
-      activity: (state) => this.screen.publishActivity(state),
+      activity: (state) => {
+        this.noteLeaseStatus(state.status)
+        this.screen.publishActivity(state)
+      },
       session: (state) => this.emit('session', state satisfies HermesSessionState),
       requestOpened: (request) => {
         if (isAnswerableRequest(request.method)) {
@@ -212,6 +225,7 @@ export class HermesHeadless extends EventEmitter {
       },
       requestClosed: (id, reason) => this.emit('request-closed', { id, reason }),
       turnSettled: () => {
+        this.leaseWait = false
         this.pendingTurns = Math.max(0, this.pendingTurns - 1)
         // In lane mode our turn ending can free held prompts only after the
         // tail is re-read (a phone message may have queued behind it).
@@ -846,9 +860,11 @@ export class HermesHeadless extends EventEmitter {
     const now = this.now()
     if (tail?.key !== this.laneTailSeen?.key) this.laneTailSeen = tail ? { key: tail.key, since: now } : null
     const stale = this.laneTailSeen !== null && now - this.laneTailSeen.since > STALE_BUSY_TAIL_MS
-    // Our OWN turn is never "the phone is busy": Hermes' turn lease orders a
-    // phone message behind it, and our later prompts go with `queued: true`.
-    const busy = !this.turnInFlight && !stale && isTailBusy(tail, this.ownUserRowIds)
+    // Our OWN running turn is never "the phone is busy": Hermes' turn lease
+    // orders a phone message behind it, and our later prompts go with
+    // `queued: true`. But our turn WAITING on the lease means the phone holds
+    // the conversation right now (noteLeaseStatus).
+    const busy = this.leaseWait || (!this.turnInFlight && !stale && isTailBusy(tail, this.ownUserRowIds))
     const changed = busy !== this.laneBusy
     this.laneBusy = busy
     if (changed) this.emitLane()
@@ -909,6 +925,15 @@ export class HermesHeadless extends EventEmitter {
   setLanePollingPaused(paused: boolean): void {
     this.lanePollingPaused = paused
     if (!paused) void this.refreshLane()
+  }
+
+  private noteLeaseStatus(status: string | null): void {
+    if (!status || this.options.target.mode !== 'lane') return
+    const waiting = /another hermes process is using this session/i.test(status)
+    const free = /^session is free/i.test(status.trim())
+    if (!waiting && !free) return
+    this.leaseWait = waiting
+    this.evaluateLane()
   }
 
   private emitLane(): void {
