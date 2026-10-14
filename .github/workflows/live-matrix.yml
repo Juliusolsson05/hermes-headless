@@ -1,0 +1,55 @@
+# Live tier against REAL Hermes releases (agent-code#1496 plan Stage F, r7 F6).
+#
+# WHY a separate workflow and not part of CI: it builds two Python runtimes
+# from upstream tags and boots real `hermes serve` processes (minutes, network
+# to GitHub and PyPI). The deterministic corpus tests in CI stay the fast
+# gate; this is the release acceptance a contract number cannot give (v0.22.0
+# still reports desktop contract 8, so "compatible" never meant "tested").
+#
+# WHY fail on zero tests: the live suite skips itself when no runtime is
+# installed (`describe.skip`), and `--passWithNoTests` would turn a broken
+# setup into a green check. Each job asserts it ran the expected count.
+name: Live matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['v0.21.7', 'v0.22.0']
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: npm ci
+      - name: Fetch Hermes ${{ matrix.release }}
+        run: git clone --depth 1 --branch "${{ matrix.release }}" https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-src"
+      - name: Build the runtime
+        env:
+          HERMES_SOURCE: ${{ runner.temp }}/hermes-src
+          HERMES_LIVE_RUNTIME: ${{ github.workspace }}/.cache/hermes-runtime
+          HERMES_LIVE_PYTHON: '3.14'
+        run: |
+          npm run live:setup
+          test "$(cat .cache/hermes-runtime/SOURCE_COMMIT)" = "$(git -C "$RUNNER_TEMP/hermes-src" rev-parse HEAD)"
+          echo "Hermes ${{ matrix.release }} at $(cat .cache/hermes-runtime/SOURCE_COMMIT)"
+      - name: Live tests
+        env:
+          HERMES_LIVE_RUNTIME: ${{ github.workspace }}/.cache/hermes-runtime
+        run: |
+          npx vitest run --config vitest.live.config.ts --reporter=json --outputFile=live-results.json
+          node -e "const r=require('./live-results.json'); const ran=r.numPassedTests+r.numFailedTests; console.log('ran', ran, 'passed', r.numPassedTests); if (ran < 7) { console.error('Expected at least 7 live tests to RUN; the suite skipped itself.'); process.exit(1) }"

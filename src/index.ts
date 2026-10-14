@@ -25,7 +25,7 @@ export type { CommittedRow, SemanticEvent } from './reconcile/ConversationReconc
 export { CommittedChannel, ScreenChannel, SemanticChannel } from './channels/index.js'
 export type { HistoryBoundary, ScreenActivityEvent } from './channels/index.js'
 export * from './auth/index.js'
-export { backendCompatibility, MIN_DESKTOP_CONTRACT, TESTED_DESKTOP_CONTRACT, TESTED_HERMES_RELEASE } from './version.js'
+export { backendCompatibility, MIN_DESKTOP_CONTRACT, TESTED_DESKTOP_CONTRACT, TESTED_HERMES_RELEASE, TESTED_HERMES_RELEASES } from './version.js'
 export type { BackendCompatibility } from './version.js'
 export { ANSWERABLE_REQUESTS, isAnswerableRequest } from './contract/catalog.js'
 export type { AnswerableRequestMethod } from './contract/catalog.js'

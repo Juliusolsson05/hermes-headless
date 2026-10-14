@@ -10,7 +10,14 @@
 
 export const TESTED_DESKTOP_CONTRACT = 8
 export const MIN_DESKTOP_CONTRACT = 7
-export const TESTED_HERMES_RELEASE = 'v0.21.7'
+/**
+ * Releases the corpus AND the live tier have been run against. Not the gate
+ * (desktop_contract is: v0.21.7 and v0.22.0 both say 8, so a contract number
+ * alone never meant "tested", r7 F3); it is what a release bump must update
+ * after `test:live` passes against the new tag (live-matrix.yml).
+ */
+export const TESTED_HERMES_RELEASES = ['v0.21.7', 'v0.22.0'] as const
+export const TESTED_HERMES_RELEASE = TESTED_HERMES_RELEASES[TESTED_HERMES_RELEASES.length - 1]!
 
 export type BackendCompatibility =
   | { kind: 'tested'; contract: number }
