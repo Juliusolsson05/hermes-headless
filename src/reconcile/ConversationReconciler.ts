@@ -285,11 +285,19 @@ export class ConversationReconciler {
     // long conversation, ids outside the listing's span are simply not in
     // it; treating them as gone fired a false 'rewrite' reset right after a
     // reload, which wiped the pane and (through the renderer's reset gate)
-    // silenced the turn that was running. A real rewrite (/compress, S12)
-    // replaces ids INSIDE the span, so it is still caught.
+    // silenced the turn that was running.
     const low = ids.length > 0 ? Math.min(...ids) : Number.POSITIVE_INFINITY
     const high = ids.length > 0 ? Math.max(...ids) : Number.NEGATIVE_INFINITY
-    const rewritten = this.knownRowIds.some((id) => id >= low && id <= high && !listed.has(id))
+    const vanishedInside = this.knownRowIds.some((id) => id >= low && id <= high && !listed.has(id))
+    // Compression REPLACES the transcript with rows whose ids are all above
+    // every id the client knows (recorded: T7b in-place compaction
+    // [1..51] → [52..63]; S20 /compress [1..62] → [65..76]). No known id is
+    // inside that span, so it needs its own rule: a listing that shares NO
+    // row with what we hold is a different transcript, not a narrower window
+    // (a narrower window of a growing conversation always holds our newest
+    // rows). Review finding, hermes-headless#2 round 1.
+    const disjoint = ids.length > 0 && this.knownRowIds.length > 0 && !this.knownRowIds.some((id) => listed.has(id))
+    const rewritten = vanishedInside || disjoint
     if (rewritten) {
       this.resetHistory('rewrite', messages)
       this.replayOpenTurn()
@@ -551,7 +559,7 @@ export class ConversationReconciler {
   private withLiveToolResult(row: TranscriptMessage): TranscriptMessage {
     if (row.role !== 'tool' || typeof row.tool_call_id !== 'string') return row
     if (row.content !== undefined && row.content !== null && row.content !== '') return row
-    const live = this.liveToolResults.get(row.tool_call_id)
+    const live = this.liveToolResults.get(this.toolResultKey(row.tool_call_id))
     if (!live) return row
     return { ...row, content: live.content, ...(live.isError ? { tool_error: true } : {}) } as TranscriptMessage
   }
@@ -706,7 +714,7 @@ export class ConversationReconciler {
         ? payload.summary
         : textOf(payload.result)
     const isError = toolResultIsError(payload)
-    this.liveToolResults.set(payload.tool_id, { content, isError })
+    this.liveToolResults.set(this.toolResultKey(payload.tool_id), { content, isError })
     const toolBlock = turn.toolBlocks.get(payload.tool_id)
     if (toolBlock?.tool) toolBlock.tool.result = { content, isError }
     this.emit({
@@ -761,6 +769,18 @@ export class ConversationReconciler {
     this.closeAllRequests('settled')
     this.out.activity({ active: false, status: null })
     this.out.turnSettled({ persisted: payload.persisted_turn ?? null, status })
+  }
+
+  /**
+   * Tool call ids are NOT unique across conversations: recorded S5 (v0.22.0)
+   * has `call_approval_0_0` in two conversations, one ran and one was denied.
+   * A consumer-shared cache keyed by call id alone showed one conversation's
+   * output in the other (review finding, both reviewers). Keyed by the
+   * STORED id, which survives a client rebuild (the cache's reason to exist);
+   * a rotating compression changes it, which only costs re-fetching outputs.
+   */
+  private toolResultKey(toolCallId: string): string {
+    return `${this.storedSessionId}:${toolCallId}`
   }
 
   /**

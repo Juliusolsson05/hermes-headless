@@ -62,8 +62,13 @@ describe('Telegram lane mode (recorded T5: hold, then send)', () => {
     // History as the recorded pane saw it: idle (r3), phone turn running
     // (r4: the phone's user row 4 is the tail), phone reply landed (r44).
     let history = resultOf(entries, 'r3')
+    // The clock of the recording: the busy rule ages a tail by Hermes' own
+    // row timestamp, so replaying a recording hours later must not make the
+    // phone turn look long dead. 2 s after the phone's user row was written.
+    const phoneRow = (resultOf(entries, 'r4').messages as Array<{ timestamp?: number }>).at(-1)!
+    const now = () => phoneRow.timestamp! * 1000 + 2_000
     const socket = new FakeSocket()
-    const headless = new HermesHeadless({ target: { mode: 'lane', sessionKey: DM }, rest: recordedRest(() => listing!), dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000 })
+    const headless = new HermesHeadless({ target: { mode: 'lane', sessionKey: DM }, rest: recordedRest(() => listing!), dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000, now })
     const lanes: HermesLaneState[] = []
     headless.on('lane', (state: HermesLaneState) => lanes.push(state))
     playServer(socket, (method) => {
@@ -166,6 +171,107 @@ describe('Telegram lane mode (recorded T4: our turn waits on the phone\'s lease)
     await waitFor(() => lanes.at(-1)?.busy === true, 'busy from the lease status')
     socket.push(free)
     await waitFor(() => lanes.at(-1)?.busy === false, 'idle after Session is free')
+    await headless.stop()
+  })
+})
+
+describe('a phone turn that died long ago (review: stale by the row\'s own age)', () => {
+  it('does not hold a pane prompt behind a phone message from hours ago (recorded T5 tail, replayed 6 h later)', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const [listing] = listings(entries)
+    const phoneRow = (resultOf(entries, 'r4').messages as Array<{ timestamp?: number }>).at(-1)!
+    const socket = new FakeSocket()
+    const headless = new HermesHeadless({ target: { mode: 'lane', sessionKey: DM }, rest: recordedRest(() => listing!), dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000, now: () => phoneRow.timestamp! * 1000 + 6 * 3_600_000 })
+    playServer(socket, (method) => {
+      if (method === 'client.capabilities') return CAPS
+      if (method === 'session.resume') return resultOf(entries, 'r2')
+      if (method === 'session.events.since') return RING
+      if (method === 'session.history') return resultOf(entries, 'r4')
+      if (method === 'prompt.submit') return { status: 'streaming', user_row_id: 6 }
+      return {}
+    })
+    const starting = headless.start()
+    await flush()
+    socket.push(READY_FRAME())
+    await starting
+    expect((await headless.prompt('Hours later.')).status).toBe('streaming')
+    await headless.stop()
+  })
+})
+
+describe('fail closed (review: a lane prompt never goes out when the tip check failed)', () => {
+  it('holds the prompt when the thread listing errors, instead of sending to a possibly ended conversation', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const [listing] = listings(entries)
+    let failing = false
+    const rest = recordedRest(() => {
+      if (failing) throw new Error('502 Bad Gateway')
+      return listing!
+    })
+    const socket = new FakeSocket()
+    const headless = new HermesHeadless({ target: { mode: 'lane', sessionKey: DM }, rest, dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000 })
+    playServer(socket, (method) => {
+      if (method === 'client.capabilities') return CAPS
+      if (method === 'session.resume') return resultOf(entries, 'r2')
+      if (method === 'session.events.since') return RING
+      if (method === 'session.history') return resultOf(entries, 'r3')
+      if (method === 'prompt.submit') return { status: 'streaming', user_row_id: 6 }
+      return {}
+    })
+    const starting = headless.start()
+    await flush()
+    socket.push(READY_FRAME())
+    await starting
+    failing = true
+    expect((await headless.prompt('While REST is down.')).status).toBe('held')
+    expect(socket.sent.some((frame) => frame.method === 'prompt.submit')).toBe(false)
+    // REST is back; the next change signal resolves the tip and sends it.
+    failing = false
+    socket.push({ jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', session_id: '', payload: {} } })
+    await waitFor(() => socket.sent.some((frame) => frame.method === 'prompt.submit'), 'the held prompt after REST recovers')
+    await headless.stop()
+  })
+})
+
+describe('Telegram lane mode (recorded T7: rotating compression)', () => {
+  it('follows the compression tip as the SAME conversation, with no new-conversation reset', async () => {
+    const entries = recordingFor('T7', 'v0.22.0')
+    const all = listings(entries)
+    // latest-descendant as recorded: before compression the root is its own
+    // tip; after it the root's descendant is the child (T7:289/309).
+    const descendants = entries
+      .filter((entry) => entry.dir === 'in' && entry.kind === 'http' && /latest-descendant/.test(String(entry.frame.url)) && entry.frame.status === 200)
+      .map((entry) => entry.frame.body as LatestDescendant)
+    const moved = descendants.find((body) => body.changed)!
+    let listing = all[0]!
+    const rest = {
+      listSessions: async () => ({ sessions: listing }),
+      latestDescendant: async (id: string): Promise<LatestDescendant> => (id === moved.requested_session_id && listing === all.at(-1) ? moved : { requested_session_id: id, session_id: id, path: [id], changed: false }),
+    } as unknown as HermesRest
+    const resumed = entries.filter((entry) => entry.dir === 'in' && entry.kind === 'ws' && Array.isArray((entry.frame.result as { messages?: unknown } | undefined)?.messages) && (entry.frame.result as { session_id?: string }).session_id)
+      .map((entry) => entry.frame.result as Record<string, unknown>)
+    const socket = new FakeSocket()
+    const headless = new HermesHeadless({ target: { mode: 'lane', sessionKey: DM }, rest, dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000 })
+    const moves: LaneMove[] = []
+    headless.on('lane-moved', (move: LaneMove) => moves.push(move))
+    const resets: string[] = []
+    headless.committed.on('boundary', (boundary: { type: string; reason?: string }) => { if (boundary.type === 'reset') resets.push(String(boundary.reason)) })
+    playServer(socket, (method, params) => {
+      if (method === 'client.capabilities') return CAPS
+      if (method === 'session.resume') return resumed.find((result) => result.stored_session_id === params.session_id || result.resumed === params.session_id) ?? resumed[0]
+      if (method === 'session.events.since') return RING
+      if (method === 'session.history') return { count: 0, messages: [] }
+      if (method === 'prompt.submit') return { status: 'streaming', user_row_id: 99 }
+      return {}
+    })
+    const starting = headless.start()
+    await flush()
+    socket.push(READY_FRAME())
+    await starting
+    listing = all.at(-1)!
+    await headless.prompt('After compression.')
+    expect(moves.map((move) => move.reason)).toEqual(['compression'])
+    expect(resets).not.toContain('new-conversation')
     await headless.stop()
   })
 })

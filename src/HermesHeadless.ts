@@ -185,7 +185,7 @@ export class HermesHeadless extends EventEmitter {
   private readonly held: Array<{ id: string; text: string; heldAt: number }> = []
   private holdCounter = 0
   private draining = false
-  private laneRefresh: Promise<void> | null = null
+  private laneRefresh: Promise<boolean> | null = null
   private laneRefreshAgain = false
   private laneDebounce: ReturnType<typeof setTimeout> | null = null
   private laneBackstop: ReturnType<typeof setInterval> | null = null
@@ -281,6 +281,12 @@ export class HermesHeadless extends EventEmitter {
       stage = 'attach'
       await this.bindTarget(connection)
     } catch (error) {
+      // An attach failure left the socket (and its heartbeat) open, and the
+      // app's failed-spawn path never stops the session: one leaked socket
+      // per retry (review). Same teardown as detach().
+      this.connectGeneration += 1
+      this.connection?.close(1000, 'start-failed')
+      this.connection = null
       throw new HermesStartError(stage, error)
     }
   }
@@ -349,6 +355,7 @@ export class HermesHeadless extends EventEmitter {
       // bubble, so say it, or the pane looks like the answer just vanished
       // (r4 F7, plan Stage A).
       this.emit('turn-lost', { reason: 'backend-restarted' })
+      this.leaseWait = false
     }
     if (this.options.target.mode === 'lane') {
       // Whatever happened while we were away (Telegram /new, compression),
@@ -445,6 +452,10 @@ export class HermesHeadless extends EventEmitter {
         if (reason === 'new-conversation') this.reconciler.beginNewConversation(resumed)
         else this.reconciler.applySnapshot(resumed, 'snapshot', { seedInflight: turnStart === null })
         this.pendingTurns = resumed.running ? 1 : 0
+        // The turn state is rebuilt from the server: a lease wait we were in
+        // is over (restart, reclaim, lane move); keeping it held every prompt
+        // forever (review, both reviewers).
+        this.leaseWait = false
         // A long turn (> the 512-event ring) whose start was evicted, but which
         // completed between the rebind and the ring read: the snapshot seeded
         // it as running and nothing would ever settle it, so dispatch the
@@ -481,8 +492,13 @@ export class HermesHeadless extends EventEmitter {
       // a Telegram /new would REOPEN that ended row and fork the thread.
       // refreshLane also refetches history, so the busy decision below is
       // made on the tail as of now, not as of the last signal.
-      await this.refreshLane()
-      if (!options.force && (this.laneBusy || this.held.length > 0)) {
+      const fresh = await this.refreshLane()
+      // FAIL CLOSED (review, hermes-headless#2): when the tip could not be
+      // re-resolved (REST 502 while the gateway restarts, a timeout), sending
+      // now could reopen an ended row (F2e) or land inside a phone turn (T4).
+      // Hold instead; the next successful refresh (change signal or the
+      // backstop poll) sends it, and "Send now" stays the user's escape.
+      if (!options.force && (!fresh || this.laneBusy || this.held.length > 0)) {
         // Behind a running phone turn, or behind earlier held prompts (order
         // is the user's order). See lane/laneBusy.ts for why holding is not
         // optional.
@@ -807,41 +823,49 @@ export class HermesHeadless extends EventEmitter {
    * that arrives while one runs makes it run once more afterwards, so the
    * LAST signal is always reflected.
    */
-  private refreshLane(): Promise<void> {
-    if (this.options.target.mode !== 'lane' || this.stopped) return Promise.resolve()
+  /** Resolves true when the LAST pass resolved the tip and read history; false when it failed. */
+  private refreshLane(): Promise<boolean> {
+    if (this.options.target.mode !== 'lane' || this.stopped) return Promise.resolve(false)
     if (this.laneRefresh) {
       this.laneRefreshAgain = true
       return this.laneRefresh
     }
     const run = (async () => {
+      let ok = false
       do {
         this.laneRefreshAgain = false
-        await this.refreshLaneOnce()
+        try {
+          await this.refreshLaneOnce()
+          ok = true
+        } catch (error) {
+          ok = false
+          this.emit('lane-error', error instanceof Error ? error : new Error(String(error)))
+        }
       } while (this.laneRefreshAgain && !this.stopped)
-    })()
-      .catch((error: unknown) => {
-        this.emit('lane-error', error instanceof Error ? error : new Error(String(error)))
-      })
-      .finally(() => {
-        this.laneRefresh = null
-      })
+      return ok
+    })().finally(() => {
+      this.laneRefresh = null
+    })
     this.laneRefresh = run
     return run
   }
 
   private async refreshLaneOnce(): Promise<void> {
     const connection = this.connection
-    if (!connection?.isOpen) return
+    if (!connection?.isOpen) throw new Error('Hermes is not connected')
     const tip = await this.resolveLaneTip()
+    if (!tip) throw new Error('The Telegram thread has no live conversation right now')
     const current = this.reconciler.currentStoredSessionId
-    if (tip && current && tip !== current) {
+    if (current && tip !== current) {
       const reason = await this.laneMoveReason(current, tip)
-      this.emit('lane-moved', { from: current, to: tip, reason } satisfies LaneMove)
       await this.attachByResume(connection, tip, reason === 'new-conversation' ? 'new-conversation' : 'snapshot')
       this.ownUserRowIds.clear()
+      // After the move succeeded: a failed re-resume used to announce the
+      // move anyway, and the retry announced it again (review).
+      this.emit('lane-moved', { from: current, to: tip, reason } satisfies LaneMove)
     }
     await this.scheduleHistoryFetch()
-    this.evaluateLane()
+    this.evaluateLane(true)
   }
 
   /** Compression keeps the conversation (seamless); anything else is a different one. */
@@ -854,11 +878,24 @@ export class HermesHeadless extends EventEmitter {
     }
   }
 
-  private evaluateLane(): void {
+  /**
+   * `tipFresh`: called at the end of a lane refresh, i.e. the stored id was
+   * just re-resolved. Only then may held prompts be sent (§6.2: before EVERY
+   * submit); from any other trigger (our turn settling, a lease status) a
+   * refresh runs first and comes back here with `tipFresh` (review).
+   */
+  private evaluateLane(tipFresh = false): void {
     if (this.options.target.mode !== 'lane') return
     const tail: LaneTail | null = laneTail(this.lastHistory ?? [])
     const now = this.now()
-    if (tail?.key !== this.laneTailSeen?.key) this.laneTailSeen = tail ? { key: tail.key, since: now } : null
+    if (tail?.key !== this.laneTailSeen?.key) {
+      // Seeded from the row's own age when Hermes stamped it, so a pane
+      // opened on a phone turn that died hours ago does not hold prompts for
+      // another 5 minutes (review). A minute of slack for clock skew between
+      // this Mac and the server.
+      const rowAgeMs = tail?.timestamp ? Math.max(0, now - tail.timestamp * 1000 - 60_000) : 0
+      this.laneTailSeen = tail ? { key: tail.key, since: now - rowAgeMs } : null
+    }
     const stale = this.laneTailSeen !== null && now - this.laneTailSeen.since > STALE_BUSY_TAIL_MS
     // Our OWN running turn is never "the phone is busy": Hermes' turn lease
     // orders a phone message behind it, and our later prompts go with
@@ -868,7 +905,10 @@ export class HermesHeadless extends EventEmitter {
     const changed = busy !== this.laneBusy
     this.laneBusy = busy
     if (changed) this.emitLane()
-    if (!busy) void this.drainHeld()
+    if (!busy && this.held.length > 0) {
+      if (tipFresh) void this.drainHeld()
+      else void this.refreshLane()
+    }
   }
 
   private async drainHeld(): Promise<void> {
@@ -892,6 +932,10 @@ export class HermesHeadless extends EventEmitter {
 
   /** "Send now": submit a held prompt despite the busy lane (the user accepts the T4 framing risk). */
   async releaseHeld(holdId: string): Promise<PromptOutcome | null> {
+    if (!this.held.some((hold) => hold.id === holdId)) return null
+    // "Send now" overrides BUSY, never the tip check: it must still go to the
+    // thread's live conversation (§6.2, review).
+    if (!(await this.refreshLane())) throw new HermesPromptError('not-ready', 'Could not confirm the Telegram thread; try again in a moment.')
     const index = this.held.findIndex((hold) => hold.id === holdId)
     if (index < 0) return null
     const [hold] = this.held.splice(index, 1)

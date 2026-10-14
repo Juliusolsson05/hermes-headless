@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest'
 import { ConversationReconciler, type CommittedRow, type ReconcilerOutput, type SemanticEvent, type HermesNotice, type HermesSideAnswer } from './ConversationReconciler.js'
 import { classifyFrame, envelopeFromReplay } from '../contract/frames.js'
 import type { EventEnvelope, OpenRequestEntry, SessionResumeResult, TranscriptMessage } from '../contract/wire.js'
-import { corpusScenarios, inboundFrames, latestRecording, type CorpusEntry } from '../testing/corpus.js'
+import { corpusScenarios, inboundFrames, latestRecording, recordingFor, type CorpusEntry } from '../testing/corpus.js'
 
 type Collected = {
   semantic: SemanticEvent[]
@@ -466,5 +466,77 @@ describe('tool output across a client rebuild (bundle 2026-10-14T16-26-49: 187 o
     expect(tools).toHaveLength(3)
     expect(tools.every((row) => typeof row.row.content === 'string' && (row.row.content as string).length > 0)).toBe(true)
     expect(tools.map((row) => row.row.tool_error === true)).toEqual([false, true, false])
+  })
+})
+
+// hermes-headless#2 review round 1: the span rule alone missed compression,
+// where every new row id is ABOVE every known one (both reviewers, replayed).
+describe('compression is a rewrite even when every new id is above the old ones', () => {
+  function histories(scenario: string) {
+    return inboundFrames(recordingFor(scenario, 'v0.22.0'))
+      .map((frame) => frame.result as { messages?: TranscriptMessage[]; count?: number } | undefined)
+      .filter((result): result is { messages: TranscriptMessage[] } => Array.isArray(result?.messages) && typeof (result as { count?: number }).count === 'number')
+      .map((result) => result.messages)
+  }
+  const ids = (rows: TranscriptMessage[]) => rows.map((row) => row.row_id).filter((id): id is number => typeof id === 'number')
+
+  it('S20: /compress from our own pane (recorded result; the pre-compress rows 1..62 are what its before_messages counted)', () => {
+    const frames = inboundFrames(recordingFor('S20', 'v0.22.0'))
+    const compressed = frames.map((frame) => frame.result as { before_messages?: number; messages?: TranscriptMessage[] } | undefined)
+      .find((result) => (result?.before_messages ?? 0) > 2 && Array.isArray(result?.messages))!
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot({ session_id: 'rt', stored_session_id: 's', messages: [] } as never, 'snapshot')
+    // Mechanical stand-in for the 62 rows the pane held: S20 never re-read
+    // them, only their count (labelled, not invented content).
+    reconciler.applyHistory(Array.from({ length: compressed.before_messages! }, (_, at) => ({ role: at % 2 ? 'assistant' : 'user', text: 'x', row_id: at + 1 })))
+    const resetsBefore = got.resets.length
+    reconciler.applyHistory(compressed.messages!)
+    expect(got.resets.slice(resetsBefore).map((reset) => reset.reason)).toEqual(['rewrite'])
+  })
+
+  for (const scenario of ['T7b']) {
+    it(`${scenario}: the post-compression history replaces the transcript instead of being appended`, () => {
+      const all = histories(scenario)
+      const index = all.findIndex((rows, at) => at > 0 && ids(rows).length > 0 && Math.min(...ids(rows)) > Math.max(...ids(all[at - 1]!)))
+      expect(index).toBeGreaterThan(0)
+      const { out, got } = collector()
+      const reconciler = new ConversationReconciler(out)
+      reconciler.applySnapshot({ session_id: 'rt', stored_session_id: 's', messages: [] } as never, 'snapshot')
+      reconciler.applyHistory(all[index - 1]!)
+      const resetsBefore = got.resets.length
+      reconciler.applyHistory(all[index]!)
+      expect(got.resets.slice(resetsBefore).map((reset) => reset.reason)).toEqual(['rewrite'])
+    })
+  }
+})
+
+describe('a shared tool-result cache keeps conversations apart (recorded S5: one call id, two conversations)', () => {
+  it('a reload of conversation A gets A\'s output, not B\'s', () => {
+    const entries = recordingFor('S5', 'v0.22.0')
+    const frames = inboundFrames(entries)
+    const completes = frames.filter((frame) => (frame.params as { type?: string } | undefined)?.type === 'tool.complete')
+      .map((frame) => frame.params as { session_id: string; payload: { tool_id: string } })
+    const shared = completes.find((a) => completes.some((b) => b.session_id !== a.session_id && b.payload.tool_id === a.payload.tool_id))!
+    const other = completes.find((b) => b.session_id !== shared.session_id && b.payload.tool_id === shared.payload.tool_id)!
+    const cache = new Map<string, { content: string; isError: boolean }>()
+    const fold = (sid: string, stored: string) => {
+      const reconciler = new ConversationReconciler(collector().out, cache)
+      reconciler.applySnapshot({ session_id: sid, stored_session_id: stored, messages: [] } as never, 'snapshot')
+      for (const frame of frames) {
+        const params = frame.params as { type?: string; session_id?: string } | undefined
+        if (frame.method === 'event' && params?.session_id === sid) reconciler.applyEvent(params as never)
+      }
+    }
+    fold(shared.session_id, 'stored-A')
+    fold(other.session_id, 'stored-B')
+    // Reload A: a new client commits A's tool row from history.
+    const { out, got } = collector()
+    new ConversationReconciler(out, cache).applySnapshot({ session_id: 'rt2', stored_session_id: 'stored-A', messages: [{ role: 'tool', tool_call_id: shared.payload.tool_id, name: 'terminal' }] } as never, 'snapshot')
+    const row = got.committed.find((entry) => entry.row.role === 'tool')!
+    const aLive = completes.filter((complete) => complete.session_id === shared.session_id)
+    expect(aLive.length).toBeGreaterThan(0)
+    const bText = JSON.stringify((other as unknown as { payload: unknown }).payload)
+    expect(bText.includes(String(row.row.content))).toBe(false)
   })
 })

@@ -60,5 +60,5 @@ jobs:
         env:
           HERMES_LIVE_RUNTIME: ${{ github.workspace }}/.cache/hermes-runtime
         run: |
-          npx vitest run --config vitest.live.config.ts --reporter=json --outputFile=live-results.json
+          npx vitest run --config vitest.live.config.ts --reporter=default --reporter=json --outputFile.json=live-results.json
           node -e "const r=require('./live-results.json'); const ran=r.numPassedTests+r.numFailedTests; console.log('ran', ran, 'passed', r.numPassedTests); if (ran < 7) { console.error('Expected at least 7 live tests to RUN; the suite skipped itself.'); process.exit(1) }"

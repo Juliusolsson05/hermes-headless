@@ -27,6 +27,8 @@ export type LaneTail = {
   key: string
   role: string
   rowId: number | null
+  /** Hermes' own row timestamp (epoch seconds), when it sent one. */
+  timestamp: number | null
 }
 
 /** The last row a user would see; Hermes' `hidden` rows are model context only. */
@@ -36,7 +38,7 @@ export function laneTail(messages: readonly TranscriptMessage[]): LaneTail | nul
     if (!row || row.display_kind === 'hidden') continue
     const rowId = typeof row.row_id === 'number' ? row.row_id : null
     const key = rowId !== null ? `row:${rowId}` : typeof row.tool_call_id === 'string' && row.tool_call_id ? `tool:${row.tool_call_id}` : `idx:${index}`
-    return { key, role: String(row.role ?? ''), rowId }
+    return { key, role: String(row.role ?? ''), rowId, timestamp: typeof row.timestamp === 'number' ? row.timestamp : null }
   }
   return null
 }
