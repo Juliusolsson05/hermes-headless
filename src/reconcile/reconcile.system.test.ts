@@ -20,11 +20,12 @@ type Collected = {
   opened: Array<OpenRequestEntry & { replayed: boolean }>
   closed: Array<{ id: string; reason: string }>
   settled: number
+  reclaimed: string[]
   unknown: string[]
 }
 
 function collector(): { out: ReconcilerOutput; got: Collected } {
-  const got: Collected = { semantic: [], committed: [], resets: [], opened: [], closed: [], settled: 0, unknown: [] }
+  const got: Collected = { semantic: [], committed: [], resets: [], opened: [], closed: [], settled: 0, reclaimed: [], unknown: [] }
   const out: ReconcilerOutput = {
     semantic: (event) => got.semantic.push(event),
     committed: (row) => got.committed.push(row),
@@ -37,6 +38,7 @@ function collector(): { out: ReconcilerOutput; got: Collected } {
     turnSettled: () => {
       got.settled += 1
     },
+    reclaimed: (reason) => got.reclaimed.push(reason),
     unknown: (shape) => got.unknown.push(shape.eventType),
   }
   return { out, got }
@@ -232,5 +234,65 @@ describe('turn content (recorded)', () => {
     reconciler.applyEvent({ type: 'brand.new.event', session_id: '' })
     reconciler.applyEvent({ type: 'brand.new.event', session_id: '' })
     expect(got.unknown).toEqual(['brand.new.event'])
+  })
+})
+
+describe('reconciler guards (survivors from package review A)', () => {
+  const s9 = () => {
+    const entries = latestRecording('S9')
+    const running = inboundFrames(entries).map((frame) => frame.result as Record<string, unknown> | undefined)
+      .find((result) => result?.running === true) as unknown as SessionResumeResult
+    return running
+  }
+
+  it('ignores events for another runtime session on the same connection', () => {
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(s9(), 'snapshot', { seedInflight: false })
+    const before = got.semantic.length
+    reconciler.applyEvent({ type: 'message.delta', session_id: 'someone-else', seq: 1, payload: { text: 'not ours' } })
+    expect(got.semantic.length).toBe(before)
+  })
+
+  it('commits a row once per generation, however often history repeats it', () => {
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    const [created] = createdSessions(latestRecording('S3'))
+    reconciler.applySnapshot(created.result, 'snapshot')
+    const rows = oracleRows(latestRecording('S3'), created.stored, created.sid)!.rows
+    reconciler.applyHistory(rows)
+    reconciler.applyHistory(rows)
+    expect(got.committed.map((row) => row.key)).toEqual(rows.map((row) => `row:${row.row_id}`))
+  })
+
+  it('seeds the running turn from the snapshot when the ring lost its start (recorded S9 running resume)', () => {
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    const running = s9()
+    reconciler.applySnapshot(running, 'snapshot')
+    expect(reconciler.turnInFlight).toBe(true)
+    const text = got.semantic.filter((event) => event.type === 'text_delta').map((event) => String(event.textSoFar)).at(-1) ?? ''
+    expect(text.length).toBeGreaterThan(0)
+    expect(running.inflight?.assistant?.trim().startsWith(text.trim().slice(0, 10))).toBe(true)
+  })
+
+  it('closes every open card when a snapshot supersedes the conversation', () => {
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(s9(), 'snapshot', { seedInflight: false })
+    reconciler.openRequest({ id: 'srq-000000000002', method: 'approval', params: {}, replayed: false })
+    reconciler.applySnapshot(s9(), 'snapshot', { seedInflight: false })
+    expect(got.closed).toEqual([{ id: 'srq-000000000002', reason: 'superseded' }])
+  })
+
+  it('follows session.info to a new stored id (compression rotates the tip)', () => {
+    const sessions: string[] = []
+    const { out } = collector()
+    const reconciler = new ConversationReconciler({ ...out, session: (state) => sessions.push(state.storedSessionId) })
+    const running = s9()
+    reconciler.applySnapshot(running, 'snapshot', { seedInflight: false })
+    reconciler.applyEvent({ type: 'session.info', session_id: running.session_id, payload: { stored_session_id: 'tip-after-compression' } })
+    expect(reconciler.currentStoredSessionId).toBe('tip-after-compression')
+    expect(sessions.at(-1)).toBe('tip-after-compression')
   })
 })

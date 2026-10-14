@@ -112,6 +112,8 @@ export class RpcConnection extends EventEmitter {
   private readonly pending = new Map<string, Pending>()
   /** Sessions whose replay fetch is in flight; their live seq'd events wait here. */
   private readonly held = new Map<string, EventEnvelope[]>()
+  /** Seq'd events parked while a conversation is being attached (see acquire). */
+  private acquiring: EventEnvelope[] | null = null
   /** Requests already surfaced on THIS connection, so a replayed copy is not delivered twice. */
   private readonly surfacedRequests = new Set<string>()
   /** Requests surfaced from `open_requests` (no live frame on this socket); see answer(). */
@@ -281,20 +283,75 @@ export class RpcConnection extends EventEmitter {
   }
 
   /**
-   * After a snapshot (resume) the client holds the conversation up to "now"
-   * but no seq for it. Ask the ring for its head so the NEXT drop replays only
-   * what follows the snapshot. Without this a drop before the first live
-   * event replays the whole ring from seq 0 and re-paints every earlier turn
-   * on top of the rows the snapshot already committed.
+   * Attach a conversation to THIS socket and hand the caller one consistent
+   * view of it: the attach result, the ring, and every event exactly once.
+   *
+   * WHY (package review A findings 1-3, each probed on recordings): Hermes
+   * starts routing a session's events to a socket the moment `session.resume`
+   * or `session.activate` rebinds it, BEFORE the response arrives, and the
+   * response's snapshot is taken at the rebind. So without a hold:
+   *   - a delta arriving before the resume response was overwritten by the
+   *     snapshot (the answer lost a chunk);
+   *   - replaying BEFORE activate left the replay→activate interval unread
+   *     (a chunk and a freshly opened approval lost);
+   *   - the resume snapshot's `open_requests` is older than a cancel that
+   *     arrives while the client is still settling, and resurrected the card.
+   *
+   * Order, each step relying on the one before:
+   *   1. park every seq'd event from now on (the runtime id of a resume is
+   *      unknown until it answers, so ALL sessions are parked);
+   *   2. `attach()`;
+   *   3. read the ring for the attached runtime id from `lastSeen`;
+   *   4. `plan(result, ring)` applies the snapshot and says from which seq the
+   *      RING should be dispatched (null: none, the snapshot covers it);
+   *   5. dispatch those ring events in seq order, then move the watermark to
+   *      the ring head;
+   *   6. surface the RING's open requests (current as of step 3, never the
+   *      older snapshot's);
+   *   7. release the parked events (only seq > watermark: anything older was
+   *      in the ring), in arrival order, so a cancel received while settling
+   *      closes the card it cancels.
    */
-  async primeWatermark(sessionId: string): Promise<void> {
-    const result = await this.call<SessionEventsSinceResult>('session.events.since', {
-      session_id: sessionId,
-      // Past any real seq: the ring returns nothing but reports its head.
-      last_seen: Number.MAX_SAFE_INTEGER,
-    }, 10_000)
-    const head = typeof result.latest_seq === 'number' ? result.latest_seq : 0
-    this.options.watermarks.set(sessionId, Math.max(this.options.watermarks.get(sessionId) ?? 0, head))
+  async acquire<T extends { session_id: string }>(
+    attach: () => Promise<T>,
+    plan: (result: T, ring: SessionEventsSinceResult) => { fromSeq: number | null },
+    lastSeen = 0,
+  ): Promise<{ result: T; ring: SessionEventsSinceResult }> {
+    if (this.acquiring) throw new Error('A conversation is already being attached on this connection.')
+    this.acquiring = []
+    let result: T
+    let ring: SessionEventsSinceResult
+    try {
+      result = await attach()
+      ring = await this.call<SessionEventsSinceResult>('session.events.since', {
+        session_id: result.session_id,
+        last_seen: lastSeen,
+      }, 10_000)
+    } catch (error) {
+      this.releaseAcquired()
+      throw error
+    }
+    const sid = result.session_id
+    const { fromSeq } = plan(result, ring)
+    const head = typeof ring.latest_seq === 'number' ? ring.latest_seq : 0
+    if (fromSeq !== null) {
+      this.options.watermarks.set(sid, fromSeq - 1)
+      const events = ring.events
+        .map(envelopeFromReplay)
+        .filter((event): event is EventEnvelope => event !== null && event.session_id === sid)
+        .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+      for (const event of events) this.dispatchSequenced(event, true)
+    }
+    this.options.watermarks.set(sid, Math.max(this.options.watermarks.get(sid) ?? 0, head))
+    for (const request of ring.open_requests ?? []) this.surfaceRequest(request.id, request.method, request.params ?? {}, true)
+    this.releaseAcquired()
+    return { result, ring }
+  }
+
+  private releaseAcquired(): void {
+    const parked = this.acquiring ?? []
+    this.acquiring = null
+    for (const event of parked) this.dispatchSequenced(event, false)
   }
 
   /** Re-deliver `open_requests` from a create/resume/activate snapshot. */
@@ -381,6 +438,10 @@ export class RpcConnection extends EventEmitter {
           return
         }
         const sid = event.session_id
+        if (sid && typeof event.seq === 'number' && this.acquiring) {
+          this.acquiring.push(event)
+          return
+        }
         if (sid && typeof event.seq === 'number' && this.held.has(sid)) {
           this.held.get(sid)!.push(event)
           return
@@ -403,6 +464,7 @@ export class RpcConnection extends EventEmitter {
       this.pending.delete(id)
     }
     this.held.clear()
+    this.acquiring = null
     this.emit('close', { code, reason })
   }
 

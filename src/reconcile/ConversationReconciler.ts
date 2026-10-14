@@ -72,6 +72,11 @@ export type ReconcilerOutput = {
   requestClosed(id: string, reason: string): void
   /** A turn finished; HermesHeadless fetches history so its rows commit. */
   turnSettled(turn: { persisted: PersistedTurn | null; status: string }): void
+  /**
+   * The backend took THIS conversation's live session away (reaped, evicted,
+   * another client). The owner re-attaches it by stored id.
+   */
+  reclaimed(reason: string): void
   unknown(shape: { eventType: string; reason: string }): void
 }
 
@@ -153,7 +158,7 @@ export class ConversationReconciler {
   /**
    * A create or resume result: the authoritative state at "now". Replaces the
    * committed history (reset + rows + caught-up), seeds an in-flight turn from
-   * `inflight`, and re-opens `open_requests`.
+   * `inflight` (open requests come from the ring, see below).
    *
    * WHY a reset even on the first snapshot: the consumer may already show rows
    * from a previous runtime of the same pane (an app reload restores entries
@@ -162,6 +167,7 @@ export class ConversationReconciler {
   applySnapshot(
     result: SessionResumeResult & { stored_session_id?: string | null },
     reason: 'snapshot' | 'new-conversation',
+    options: { seedInflight?: boolean } = {},
   ): void {
     this.runtimeSessionId = result.session_id
     this.storedSessionId = String(result.stored_session_id ?? (result as { resumed?: string }).resumed ?? this.storedSessionId)
@@ -172,7 +178,10 @@ export class ConversationReconciler {
     this.closeAllRequests('superseded')
     this.turn = null
     const inflight = result.inflight
-    if (inflight && (inflight.streaming || result.running)) {
+    // `seedInflight: false` when the owner will rebuild the running turn
+    // EXACTLY from the replay ring (RpcConnection.acquire found its
+    // message.start): seeding the snapshot's text as well would paint it twice.
+    if (options.seedInflight !== false && inflight && (inflight.streaming || result.running)) {
       // Resume DURING a turn: rebuild the live bubble from the server's
       // in-flight snapshot; live deltas continue from here.
       this.startTurn(`${this.runtimeSessionId}:resume-${this.generation}`)
@@ -181,7 +190,11 @@ export class ConversationReconciler {
     } else {
       this.out.activity({ active: false, status: null })
     }
-    for (const request of result.open_requests ?? []) this.openRequest({ ...request, replayed: true })
+    // Open requests are NOT taken from the snapshot: it was captured at the
+    // rebind, before anything the client hears while settling. The owner
+    // surfaces the ring's open requests (read after the snapshot) through the
+    // transport instead; taking these too resurrected a card whose cancel had
+    // already arrived (package review A #3).
   }
 
   /**
@@ -299,12 +312,20 @@ export class ConversationReconciler {
       case 'approval.cancelled':
         for (const id of ((payload as { request_ids?: string[] }).request_ids ?? [])) this.closeRequest(id, String((payload as { reason?: string }).reason ?? 'cancelled'))
         return
-      case 'session.reclaimed':
-        // The backend took the live session away (another client, a
-        // restart). The owner re-snapshots by stored id.
+      case 'session.reclaimed': {
+        // A BROADCAST (session_lifecycle.py _announce_session_reclaimed): it
+        // reaches every client with no outer session id, naming the reclaimed
+        // session only in its payload. Acting on another session's reclaim
+        // wiped this conversation's open approvals (package review A #5).
+        const reclaimed = payload as { session_id?: string; stored_session_id?: string; reason?: string }
+        const ours = reclaimed.session_id === this.runtimeSessionId ||
+          (Boolean(reclaimed.stored_session_id) && reclaimed.stored_session_id === this.storedSessionId)
+        if (!ours) return
         this.closeAllRequests('reclaimed')
         this.out.activity({ active: false, status: 'Reconnecting to the conversation' })
+        this.out.reclaimed(String(reclaimed.reason ?? 'reclaimed'))
         return
+      }
       default:
         if (isHandledEvent(event.type) || isIgnoredEvent(event.type)) return
         if (!this.unknownTypes.has(event.type)) {

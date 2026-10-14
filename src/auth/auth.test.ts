@@ -47,15 +47,19 @@ function replayFetch(recorded: Exchange[]) {
     queues.set(key, [...(queues.get(key) ?? []), exchange])
   }
   const calls: string[] = []
+  const inits: Array<{ key: string; init: RequestInit | undefined }> = []
   const impl = async (input: string, init?: RequestInit) => {
     const key = `${init?.method ?? 'GET'} ${new URL(input).pathname}`
     calls.push(key)
+    inits.push({ key, init })
     const next = queues.get(key)?.shift()
     if (!next) throw new Error(`no recorded exchange left for ${key}`)
     return new Response(typeof next.body === 'string' ? next.body : JSON.stringify(next.body), { status: next.status })
   }
-  return { impl, calls }
+  return { impl, calls, inits }
 }
+
+const bodyOf = (init: RequestInit | undefined) => JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
 
 const s1 = exchanges(latestRecording('S1'))
 const base = 'http://hermes.example:9119'
@@ -73,8 +77,14 @@ describe('probe (recorded S1)', () => {
 describe('token exchange and tickets (recorded S1)', () => {
   it('turns the recorded token response into a bearer pair with a millisecond expiry', async () => {
     const recorded = s1.filter((exchange) => exchange.path === '/auth/native/token')
-    const { impl } = replayFetch(recorded)
+    const { impl, inits } = replayFetch(recorded)
     const tokens = await exchangeCode({ baseUrl: base, code: 'c', codeVerifier: 'v' }, impl)
+    // The verifier is what binds the code to THIS sign-in (PKCE); a request
+    // without it would be refused by Hermes, and must never be sent empty.
+    expect(bodyOf(inits[0].init)).toEqual({ code: 'c', code_verifier: 'v' })
+    // Credentialed requests never follow redirects: a 30x to another origin
+    // must not receive the body (the sign-in code) or the bearer.
+    expect(inits[0].init?.redirect).toBe('manual')
     expect(tokens.provider).toBe('basic')
     expect(tokens.userId).toBe('agentcode')
     // The wire sends epoch seconds; a seconds value left as-is would make
@@ -96,17 +106,23 @@ describe('token exchange and tickets (recorded S1)', () => {
 
   it('returns the recorded ticket with its 30 s lifetime', async () => {
     const minted = s1.filter((exchange) => exchange.path === '/api/auth/ws-ticket' && exchange.status === 200).slice(0, 1)
-    const { impl } = replayFetch(minted)
+    const { impl, inits } = replayFetch(minted)
     const ticket = await mintWsTicket({ baseUrl: base, accessToken: 'a' }, impl)
+    expect((inits[0].init?.headers as Record<string, string>).authorization).toBe('Bearer a')
+    expect(inits[0].init?.redirect).toBe('manual')
     expect(ticket.ttlSeconds).toBe(30)
     expect(ticket.ticket.length).toBeGreaterThan(10)
   })
 
   it('rotates tokens on the recorded refresh', async () => {
     const recorded = s1.filter((exchange) => exchange.path === '/auth/native/refresh').slice(0, 1)
-    const { impl } = replayFetch(recorded)
+    const { impl, inits } = replayFetch(recorded)
     const tokens = await refreshTokens({ baseUrl: base, refreshToken: 'r', provider: 'basic' }, impl)
     expect(tokens.provider).toBe('basic')
+    // `provider` routes the refresh to the provider that minted the pair
+    // (routes.py auth_native_refresh); omitting it makes Hermes try them all.
+    expect(bodyOf(inits[0].init)).toEqual({ refresh_token: 'r', provider: 'basic' })
+    expect(inits[0].init?.redirect).toBe('manual')
   })
 
   it('treats a refresh 401 as session-expired, never as retryable', async () => {
