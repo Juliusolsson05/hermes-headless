@@ -117,7 +117,15 @@ export type HermesSideAnswer = {
   text: string
 }
 
-type Block = { index: number; kind: 'text' | 'thinking' | 'tool_use'; text: string; toolUseId?: string }
+type Block = {
+  index: number
+  kind: 'text' | 'thinking' | 'tool_use'
+  text: string
+  toolUseId?: string
+  /** Kept so an open turn can be re-announced after a history reset (replayOpenTurn). */
+  sealed?: boolean
+  tool?: { name: string; args: Record<string, unknown>; context: string | null; result?: { content: string; isError: boolean } }
+}
 
 type LiveTurn = {
   turnId: string
@@ -129,6 +137,8 @@ type LiveTurn = {
   answerText: string
   sawReasoningDelta: boolean
   toolBlocks: Map<string, Block>
+  /** Every block of the turn, in order (replayOpenTurn). */
+  blocks: Block[]
 }
 
 /** Hermes separates a post-tool answer segment with a leading blank line (S6, S8). */
@@ -250,9 +260,20 @@ export class ConversationReconciler {
   applyHistory(messages: TranscriptMessage[]): void {
     const ids = messages.map((row) => row.row_id).filter((id): id is number => typeof id === 'number')
     const listed = new Set(ids)
-    const rewritten = this.knownRowIds.some((id) => !listed.has(id))
+    // A rewrite is a known id that VANISHED from the range the listing covers.
+    // WHY the range (owner's debug bundle 2026-10-14T16-26-49): when the
+    // resume snapshot and `session.history` cover different windows of a
+    // long conversation, ids outside the listing's span are simply not in
+    // it; treating them as gone fired a false 'rewrite' reset right after a
+    // reload, which wiped the pane and (through the renderer's reset gate)
+    // silenced the turn that was running. A real rewrite (/compress, S12)
+    // replaces ids INSIDE the span, so it is still caught.
+    const low = ids.length > 0 ? Math.min(...ids) : Number.POSITIVE_INFINITY
+    const high = ids.length > 0 ? Math.max(...ids) : Number.NEGATIVE_INFINITY
+    const rewritten = this.knownRowIds.some((id) => id >= low && id <= high && !listed.has(id))
     if (rewritten) {
       this.resetHistory('rewrite', messages)
+      this.replayOpenTurn()
       return
     }
     messages.forEach((row, index) => this.commitRow(row, index))
@@ -533,6 +554,7 @@ export class ConversationReconciler {
       answerText: '',
       sawReasoningDelta: false,
       toolBlocks: new Map(),
+      blocks: [],
     }
     this.emit({ type: 'turn_started', turnId })
   }
@@ -545,6 +567,7 @@ export class ConversationReconciler {
   private openBlock(kind: Block['kind'], extra: Record<string, unknown> = {}): Block {
     const turn = this.turn!
     const block: Block = { index: turn.nextBlockIndex++, kind, text: '' }
+    turn.blocks.push(block)
     this.emit({ type: 'block_started', turnId: turn.turnId, blockIndex: block.index, kind, ...extra })
     return block
   }
@@ -553,6 +576,7 @@ export class ConversationReconciler {
     const turn = this.turn
     if (!turn?.openText) return
     this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: turn.openText.index, kind: 'text', text: turn.openText.text })
+    turn.openText.sealed = true
     turn.openText = null
   }
 
@@ -560,6 +584,7 @@ export class ConversationReconciler {
     const turn = this.turn
     if (!turn?.openThinking) return
     this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: turn.openThinking.index, kind: 'thinking' })
+    turn.openThinking.sealed = true
     turn.openThinking = null
   }
 
@@ -615,6 +640,8 @@ export class ConversationReconciler {
     const lastSegment = normalizeAnswer(turn.openText?.text ?? '')
     if (normalized === answer || normalized === lastSegment || (answer && answer.endsWith(normalized))) return
     const block = this.openBlock('thinking')
+    block.text = text
+    block.sealed = true
     this.emit({ type: 'thinking_delta', turnId: turn.turnId, blockIndex: block.index, thinkingDelta: text, thinkingSoFar: text })
     this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: block.index, kind: 'thinking' })
   }
@@ -628,6 +655,7 @@ export class ConversationReconciler {
     block.toolUseId = payload.tool_id
     turn.toolBlocks.set(payload.tool_id, block)
     const args = payload.args && typeof payload.args === 'object' ? payload.args : {}
+    block.tool = { name: payload.name, args, context: payload.context ?? null }
     this.emit({
       type: 'tool_input_finalized',
       turnId: turn.turnId,
@@ -657,6 +685,8 @@ export class ConversationReconciler {
         : textOf(payload.result)
     const isError = toolResultIsError(payload)
     this.liveToolResults.set(payload.tool_id, { content, isError })
+    const toolBlock = turn.toolBlocks.get(payload.tool_id)
+    if (toolBlock?.tool) toolBlock.tool.result = { content, isError }
     this.emit({
       type: 'tool_result',
       turnId: turn.turnId,
@@ -709,6 +739,53 @@ export class ConversationReconciler {
     this.closeAllRequests('settled')
     this.out.activity({ active: false, status: null })
     this.out.turnSettled({ persisted: payload.persisted_turn ?? null, status })
+  }
+
+  /**
+   * Re-announce the running turn after a history reset.
+   *
+   * WHY: the consumer wipes its live turn on every reset and then ignores
+   * every semantic event until a NEW `turn_started` (Agent Code's
+   * historyAwaitingTurnStart gate, useIpcSubscriptions.ts). A reset in the
+   * MIDDLE of a turn therefore silenced it: in the owner's bundle the running
+   * terminal tool never appeared and the pane said "Hermes is thinking" for
+   * the rest of the turn. Replaying what this turn has produced so far, under
+   * the same turn id, reopens the consumer's fold exactly where it was.
+   */
+  private replayOpenTurn(): void {
+    const turn = this.turn
+    if (!turn) return
+    this.emit({ type: 'turn_started', turnId: turn.turnId })
+    for (const block of turn.blocks) {
+      if (block.kind === 'tool_use' && block.tool) {
+        this.emit({ type: 'block_started', turnId: turn.turnId, blockIndex: block.index, kind: 'tool_use', toolName: block.tool.name, toolUseId: block.toolUseId })
+        this.emit({
+          type: 'tool_input_finalized',
+          turnId: turn.turnId,
+          blockIndex: block.index,
+          toolName: block.tool.name,
+          toolUseId: block.toolUseId,
+          inputJson: JSON.stringify(block.tool.args),
+          parsed: block.tool.args,
+          context: block.tool.context,
+        })
+        if (block.tool.result) {
+          this.emit({ type: 'tool_result', turnId: turn.turnId, toolUseId: block.toolUseId, content: block.tool.result.content, isError: block.tool.result.isError, durationSeconds: null, inlineDiff: null })
+        }
+        continue
+      }
+      this.emit({ type: 'block_started', turnId: turn.turnId, blockIndex: block.index, kind: block.kind })
+      if (block.kind === 'text' && block.text) {
+        this.emit({ type: 'text_delta', turnId: turn.turnId, blockIndex: block.index, textDelta: block.text, textSoFar: block.text })
+      }
+      if (block.kind === 'thinking' && block.text) {
+        this.emit({ type: 'thinking_delta', turnId: turn.turnId, blockIndex: block.index, thinkingDelta: block.text, thinkingSoFar: block.text })
+      }
+      if (block.sealed) {
+        this.emit({ type: 'block_completed', turnId: turn.turnId, blockIndex: block.index, kind: block.kind, ...(block.kind === 'text' ? { text: block.text } : {}) })
+      }
+    }
+    if (turn.answerText) this.emit({ type: 'turn_delta', turnId: turn.turnId, fullText: turn.answerText })
   }
 
   private closeAllRequests(reason: string): void {

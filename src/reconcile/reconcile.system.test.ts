@@ -403,3 +403,44 @@ describe('reconciler guards (round-1 review c2 survivors)', () => {
   })
 })
 
+
+// The owner's debug bundle (2026-10-14T16-26-49): after a pane reload, a
+// running turn went silent for the rest of the turn. Two guards.
+describe('history resets during a running turn (bundle 2026-10-14T16-26-49)', () => {
+  it('does not call a narrower history window a rewrite (recorded S12 resume, its tail as the listing)', () => {
+    const entries = latestRecording('S12')
+    const resume = inboundFrames(entries).map((frame) => frame.result as Record<string, unknown> | undefined).filter((result) => result && typeof result.resumed === 'string').at(-1) as unknown as SessionResumeResult
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(resume, 'snapshot')
+    const resets = got.resets.length
+    // Mechanical mutation of the recording: the same rows, minus the oldest
+    // half, as a listing that covers a narrower window would return them.
+    reconciler.applyHistory(resume.messages.slice(Math.floor(resume.messages.length / 2)))
+    expect(got.resets.length).toBe(resets)
+  })
+
+  it('re-announces the running turn after a real rewrite, under the same turn id (recorded S4)', () => {
+    const entries = latestRecording('S4')
+    const [session] = createdSessions(entries)
+    const { out, got } = collector()
+    const reconciler = new ConversationReconciler(out)
+    reconciler.applySnapshot(session.result, 'snapshot')
+    // Fold the recorded turn up to its first tool result, i.e. mid-turn.
+    const events = sessionEvents(entries, session.sid)
+    const firstResult = events.findIndex((event) => event.type === 'tool.complete')
+    for (const event of events.slice(0, firstResult + 1)) reconciler.applyEvent(event)
+    const turnId = got.semantic.find((event) => event.type === 'turn_started')!.turnId
+    const row = (id: number) => ({ role: 'user', text: 'x', row_id: id })
+    reconciler.applyHistory([row(1), row(2), row(3)])
+    reconciler.applyHistory([row(1), row(3), row(4)]) // row 2 vanished inside the span: a rewrite (the S12 shape)
+    expect(got.resets.at(-1)?.reason).toBe('rewrite')
+    // The recorded turn started once; the reset must announce it a second time.
+    expect(got.semantic.filter((event) => event.type === 'turn_started')).toHaveLength(2)
+    const starts = got.semantic.map((event, index) => (event.type === 'turn_started' ? index : -1)).filter((index) => index >= 0)
+    const afterReset = got.semantic.slice(starts.at(-1))
+    expect(afterReset[0]).toMatchObject({ type: 'turn_started', turnId })
+    const toolId = (events[firstResult]!.payload as { tool_id: string }).tool_id
+    expect(afterReset.find((event) => event.type === 'tool_result' && event.toolUseId === toolId)).toBeDefined()
+  })
+})
