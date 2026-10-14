@@ -1,0 +1,314 @@
+// Exactly-once delivery across reconnects, on RECORDED frames.
+//
+// Fixtures: research/corpus/S8 (a real <20 s socket drop mid-turn, recording),
+// S10 (an approval re-delivered through open_requests), S11 (backend restart,
+// new epoch). The cut-point test is a mechanical mutation of S8: it replays the
+// turn's real event sequence with the drop moved to every possible position and
+// with 0-3 live frames racing the replay response.
+
+import { describe, expect, it } from 'vitest'
+
+import { RpcConnection, type ServerRequest } from './RpcConnection.js'
+import type { EventEnvelope } from '../contract/wire.js'
+import { FakeSocket, READY_FRAME } from '../testing/fakeSocket.js'
+import { inboundFrames, latestRecording } from '../testing/corpus.js'
+
+const CAPABILITIES = { server_requests: ['approval', 'clarify', 'sudo', 'secret'], declines_not_shown: true }
+
+async function openConnection(watermarks: Map<string, number>, epoch = 'epoch-1', canAnswer = (method: string) => ['approval', 'clarify', 'sudo', 'secret'].includes(method)) {
+  const socket = new FakeSocket()
+  const opening = RpcConnection.open(socket, { canAnswer, watermarks, heartbeatIntervalMs: 60_000 })
+  socket.push(READY_FRAME(epoch))
+  await socket.answerCall('client.capabilities', CAPABILITIES)
+  const connection = await opening
+  const events: EventEnvelope[] = []
+  const requests: ServerRequest[] = []
+  connection.on('event', (event: EventEnvelope) => events.push(event))
+  connection.on('request', (request: ServerRequest) => requests.push(request))
+  return { socket, connection, events, requests }
+}
+
+/** Every seq'd event of the S8 session, from all three recorded sources, in seq order. */
+function s8TurnEvents(): { sid: string; events: Array<Record<string, unknown>> } {
+  const entries = latestRecording('S8')
+  const bySeq = new Map<number, Record<string, unknown>>()
+  let sid = ''
+  for (const frame of inboundFrames(entries)) {
+    if (frame.method === 'event') {
+      const params = frame.params as Record<string, unknown>
+      if (typeof params.seq === 'number' && typeof params.session_id === 'string') {
+        sid = params.session_id
+        bySeq.set(params.seq, params)
+      }
+    }
+    const result = frame.result as { events?: Array<Record<string, unknown>> } | undefined
+    for (const event of result?.events ?? []) {
+      if (typeof event.seq === 'number') bySeq.set(event.seq, event)
+    }
+  }
+  return { sid, events: [...bySeq.entries()].sort((a, b) => a[0] - b[0]).map(([, event]) => event) }
+}
+
+const eventFrame = (params: Record<string, unknown>) => ({ jsonrpc: '2.0', method: 'event', params })
+
+describe('replay across a dropped socket (recorded S8)', () => {
+  it('recorded the whole turn with no seq gap (the oracle for the cut-point test)', () => {
+    const { events } = s8TurnEvents()
+    const seqs = events.map((event) => event.seq as number)
+    expect(seqs.length).toBeGreaterThan(30)
+    for (let index = 1; index < seqs.length; index += 1) expect(seqs[index]).toBe(seqs[index - 1] + 1)
+    // session.title / session.info follow message.complete (recorded), so the
+    // completion is inside the turn's events, not necessarily last.
+    expect(events.some((event) => event.type === 'message.complete')).toBe(true)
+  })
+
+  it('delivers every event exactly once in seq order for every cut point, gap and race', async () => {
+    // Model of the real race, through acquire() (the path HermesHeadless
+    // reconnects with; round-1 review c2 #4: this sweep used to exercise a
+    // replay() production never called). Hermes routes the session's events
+    // to the new socket from the moment `session.activate` rebinds it, so
+    // frames NEWER than the ring's gap can arrive before the activate reply
+    // AND between it and the ring reply. Dispatched first, they would move
+    // the watermark past the whole gap. (A backend restart, recorded S11, is
+    // handled above this layer: HermesHeadless.reconnect compares epochs and
+    // goes straight to session.resume; pinned in HermesHeadless.system.test.)
+    const { sid, events } = s8TurnEvents()
+    for (let cut = 0; cut < events.length; cut += 1) {
+      for (const gapLength of [0, 1, 4]) {
+        for (const race of [0, 1, 3]) {
+          const gap = events.slice(cut, cut + gapLength)
+          const newer = events.slice(cut + gapLength, cut + gapLength + race)
+          const rest = events.slice(cut + gapLength + race)
+          const watermarks = new Map<string, number>()
+          const first = await openConnection(watermarks)
+          for (const event of events.slice(0, cut)) first.socket.push(eventFrame(event))
+          first.socket.close(4000, 'drop')
+
+          const second = await openConnection(watermarks)
+          const lastSeen = watermarks.get(sid) ?? 0
+          const acquiring = second.connection.acquire(
+            () => second.connection.call<{ session_id: string }>('session.activate', { session_id: sid }),
+            () => ({ fromSeq: lastSeen + 1 }),
+            lastSeen,
+          )
+          const activate = await second.socket.nextSent((frame) => frame.method === 'session.activate')
+          const half = Math.ceil(newer.length / 2)
+          for (const event of newer.slice(0, half)) second.socket.push(eventFrame(event))
+          second.socket.push({ jsonrpc: '2.0', id: activate.id, result: { session_id: sid } })
+          const call = await second.socket.nextSent((frame) => frame.method === 'session.events.since')
+          for (const event of newer.slice(half)) second.socket.push(eventFrame(event))
+          second.socket.push({
+            jsonrpc: '2.0',
+            id: call.id,
+            result: { events: gap, latest_seq: gap.at(-1)?.seq ?? lastSeen, truncated: false, count: gap.length, epoch: 'epoch-1', open_requests: [] },
+          })
+          await acquiring
+          for (const event of rest) second.socket.push(eventFrame(event))
+          const delivered = [...first.events, ...second.events].map((event) => event.seq)
+          expect({ cut, gapLength, race, delivered }).toEqual({ cut, gapLength, race, delivered: events.map((event) => event.seq) })
+        }
+      }
+    }
+  })
+
+  it('parks a racing live frame until the ring lands (guards the acquisition hold)', async () => {
+    const { sid, events } = s8TurnEvents()
+    const lastSeen = events[5].seq as number
+    const watermarks = new Map<string, number>([[sid, lastSeen]])
+    const second = await openConnection(watermarks)
+    const acquiring = second.connection.acquire(
+      () => second.connection.call<{ session_id: string }>('session.activate', { session_id: sid }),
+      () => ({ fromSeq: lastSeen + 1 }),
+      lastSeen,
+    )
+    await second.socket.answerCall('session.activate', { session_id: sid })
+    const call = await second.socket.nextSent((frame) => frame.method === 'session.events.since')
+    second.socket.push(eventFrame(events[10]))
+    expect(second.events).toEqual([])
+    second.socket.push({ jsonrpc: '2.0', id: call.id, result: { events: events.slice(6, 11), latest_seq: events[10].seq, truncated: false, count: 5, epoch: 'epoch-1', open_requests: [] } })
+    await acquiring
+    expect(second.events.map((event) => event.seq)).toEqual(events.slice(6, 11).map((event) => event.seq))
+  })
+})
+
+describe('server requests', () => {
+  it('a snapshot-only attach treats pre-rebind ring events as covered and dispatches everything that arrived live', async () => {
+    // Round-2 review c1 #3 replaced the earlier "jump to the ring head" rule:
+    // Hermes reads the ring's events and its head under separate locks, so
+    // an event stamped between them is counted in the head but missing from
+    // the list, and its live copy must still be dispatched. Ring events that
+    // did NOT also arrive live predate the rebind and are in the snapshot.
+    const { sid, events } = s8TurnEvents()
+    const watermarks = new Map<string, number>()
+    const { socket, connection, events: delivered } = await openConnection(watermarks)
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
+      () => ({ fromSeq: null }),
+    )
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push(eventFrame(events[5]))
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    // The ring copy holds 3..5 (5 also arrived live) and counts 6 in its head.
+    await socket.answerCall('session.events.since', { events: events.slice(3, 6), latest_seq: events[6].seq, truncated: false, count: 3, epoch: 'epoch-1', open_requests: [] })
+    await acquiring
+    socket.push(eventFrame(events[6]))
+    expect(delivered.map((event) => event.seq)).toEqual([events[5].seq, events[6].seq])
+    expect(watermarks.get(sid)).toBe(events[6].seq)
+  })
+
+  it('re-delivers the open approval from the recorded S10 ring and answers it through request.answer', async () => {
+    const entries = latestRecording('S10')
+    const since = inboundFrames(entries).find((frame) => Array.isArray((frame.result as { open_requests?: unknown[] } | undefined)?.open_requests))!.result as Record<string, unknown>
+    const open = since.open_requests as Array<{ id: string; method: string }>
+    expect(open.map((request) => request.method)).toEqual(['approval'])
+    const sid = String((open[0] as { params?: { session_id?: string } }).params?.session_id ?? 'x')
+    const { socket, connection, requests } = await openConnection(new Map([[sid, 8]]))
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.activate', { session_id: sid }),
+      () => ({ fromSeq: 9 }),
+      8,
+    )
+    await socket.answerCall('session.activate', { session_id: sid })
+    await socket.answerCall('session.events.since', { ...since, epoch: 'epoch-1' })
+    await acquiring
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ id: open[0].id, method: 'approval', replayed: true })
+    const answering = connection.answer(open[0].id, { choice: 'once' })
+    const call = await socket.answerCall('request.answer', { status: 'ok' })
+    await answering
+    expect(call.params).toEqual({ id: open[0].id, result: { choice: 'once' } })
+  })
+
+  it('answers a live request with a plain response carrying its id', async () => {
+    const entries = latestRecording('S5')
+    const live = inboundFrames(entries).find((frame) => frame.method === 'approval')!
+    const { socket, connection, requests } = await openConnection(new Map())
+    socket.push(live)
+    expect(requests[0]).toMatchObject({ id: live.id, replayed: false })
+    await connection.answer(String(live.id), { choice: 'deny' })
+    expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: live.id, result: { choice: 'deny' } })
+  })
+
+  it('declines a request no consumer can answer at once instead of letting the agent wait (H11)', async () => {
+    // Contract probe: `preview.read` is a Desktop GUI bridge (server_requests.py)
+    // that never occurred in the corpus. Its frame shape is the S5 approval's.
+    const { socket, requests } = await openConnection(new Map())
+    socket.push({ jsonrpc: '2.0', id: 'srq-000000000001', method: 'preview.read', params: { session_id: 'abc' } })
+    expect(requests).toEqual([])
+    expect(socket.sent.at(-1)).toMatchObject({ id: 'srq-000000000001', error: { code: -32601 } })
+  })
+
+  // Round-1 review c2 #1: a live request frame that arrives WHILE a resume is
+  // attaching is held, and the ring (read after it) decides whether it is
+  // still open; one that reached this socket live stays live, so its answer
+  // is a response frame.
+  it('holds a live request during an attach and surfaces it once, live, when the ring still lists it', async () => {
+    const live = inboundFrames(latestRecording('S5')).find((frame) => frame.method === 'approval')!
+    const sid = String((live.params as { session_id: string }).session_id)
+    const { socket, connection, requests } = await openConnection(new Map())
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
+      () => ({ fromSeq: null }),
+    )
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push(live)
+    expect(requests).toEqual([])
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    await socket.answerCall('session.events.since', { events: [], latest_seq: 0, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [{ id: live.id, method: 'approval', params: live.params }] })
+    await acquiring
+    expect(requests).toEqual([expect.objectContaining({ id: live.id, replayed: false })])
+    await connection.answer(String(live.id), { choice: 'deny' })
+    expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: live.id, result: { choice: 'deny' } })
+  })
+
+  it('a held request is shown even when the ring omits it, and its held cancel then closes it in order', async () => {
+    // Round-2 review c1 #2: the ring's open-request list is built before its
+    // reply is written, so a request registered in between arrives first and
+    // is missing from the list; dropping it lost a live approval. A request
+    // cancelled while we attached is closed by its parked request.cancel,
+    // which is released AFTER the request (recorded S5 approval and cancel).
+    const frames = inboundFrames(latestRecording('S5'))
+    const cancelEvent = frames.find((frame) => frame.method === 'event' && (frame.params as { type: string }).type === 'request.cancel')!.params as Record<string, unknown>
+    const cancelledId = (cancelEvent.payload as { id: string }).id
+    const approval = frames.find((frame) => frame.method === 'approval' && frame.id === cancelledId)!
+    const sid = String((approval.params as { session_id: string }).session_id)
+    const { socket, connection, requests, events } = await openConnection(new Map())
+    const order: string[] = []
+    connection.on('request', (request: ServerRequest) => order.push(`request:${request.id}`))
+    connection.on('event', (event: EventEnvelope) => order.push(`event:${event.type}`))
+    const acquiring = connection.acquire(
+      () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
+      () => ({ fromSeq: null }),
+    )
+    const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
+    socket.push(approval)
+    socket.push(eventFrame({ ...cancelEvent, session_id: sid }))
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    await socket.answerCall('session.events.since', { events: [], latest_seq: 0, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [] })
+    await acquiring
+    expect(requests.map((request) => request.id)).toEqual([cancelledId])
+    expect(order).toEqual([`request:${cancelledId}`, 'event:request.cancel'])
+    expect(events).toHaveLength(1)
+  })
+})
+
+describe('closing', () => {
+  it('fails outstanding calls with ConnectionClosedError (effect unknown) when the socket drops', async () => {
+    const { socket, connection } = await openConnection(new Map())
+    const pending = connection.call('prompt.submit', { session_id: 'x', text: 'hi' })
+    socket.close(1006, '')
+    await expect(pending).rejects.toMatchObject({ name: 'ConnectionClosedError', method: 'prompt.submit', code: 1006 })
+  })
+})
+
+describe('heartbeat (package review B survivor)', () => {
+  it('closes a socket that has been silent past the deadline, and keeps one that streams', async () => {
+    // A fake clock with real clearTimer semantics: the ready timeout and
+    // per-call timeouts must be cancellable, or they fire and close the socket.
+    const timers = new Map<number, { fn: () => void; at: number }>()
+    let nextHandle = 1
+    let now = 0
+    const realNow = Date.now
+    Date.now = () => now
+    try {
+      const socket = new FakeSocket()
+      const opening = RpcConnection.open(socket, {
+        canAnswer: () => true,
+        watermarks: new Map(),
+        heartbeatIntervalMs: 15_000,
+        heartbeatDeadlineMs: 45_000,
+        setTimer: (fn, ms) => {
+          const handle = nextHandle++
+          timers.set(handle, { fn, at: now + ms })
+          return handle
+        },
+        clearTimer: (handle) => {
+          timers.delete(handle as number)
+        },
+      })
+      socket.push(READY_FRAME())
+      await socket.answerCall('client.capabilities', CAPABILITIES)
+      const connection = await opening
+      const advance = (ms: number) => {
+        now += ms
+        for (const [handle, timer] of [...timers.entries()].filter(([, entry]) => entry.at <= now)) {
+          timers.delete(handle)
+          timer.fn()
+        }
+      }
+      advance(15_000)
+      advance(15_000)
+      // Any inbound frame is liveness (Hermes' own client): a streaming turn
+      // keeps the socket alive even without pong replies.
+      socket.push({ jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', payload: {} } })
+      advance(15_000)
+      expect(connection.isOpen).toBe(true)
+      advance(15_000)
+      advance(15_000)
+      advance(15_000)
+      expect(connection.isOpen).toBe(false)
+    } finally {
+      Date.now = realNow
+    }
+  })
+})
