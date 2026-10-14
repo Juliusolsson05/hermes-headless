@@ -37,7 +37,7 @@ import { defaultTelegramLane, pickLaneRow, summarizeLanes, type LaneSummary } fr
 import { isTailBusy, laneTail, STALE_BUSY_TAIL_MS, type LaneTail } from './lane/laneBusy.js'
 import type { HermesRest } from './rest/HermesRest.js'
 import { parseSlash, routeSlash } from './slash/routes.js'
-import type { HermesNotice, HermesSideAnswer, ToolResultCache } from './reconcile/ConversationReconciler.js'
+import type { HermesConnectionOperation, HermesNotice, HermesSideAnswer, ToolResultCache } from './reconcile/ConversationReconciler.js'
 import { ConversationReconciler } from './reconcile/ConversationReconciler.js'
 import { ConnectionClosedError, RpcConnection, RpcError, RpcTimeoutError, type ServerRequest, type WebSocketLike } from './transport/RpcConnection.js'
 
@@ -242,6 +242,8 @@ export class HermesHeadless extends EventEmitter {
       notice: (notice: HermesNotice) => this.emit('notice', notice),
       noticeCleared: (key: string) => this.emit('notice-cleared', { key }),
       sideAnswer: (answer: HermesSideAnswer) => this.emit('side-answer', answer),
+      connection: (operation: HermesConnectionOperation) => this.emit('connection-operation', operation),
+      connectionSync: (operation: HermesConnectionOperation | null) => this.emit('connection-sync', operation),
     }, options.toolResults)
   }
 
@@ -606,6 +608,31 @@ export class HermesHeadless extends EventEmitter {
   }
 
   /** Every slash command this session can run, with Hermes' availability metadata (plan Stage E). */
+  /**
+   * Answer a connection operation's card (Hermes' `connection.respond`):
+   * per-target `approved` (with any credentials its `requiredEnv` asked for)
+   * or `skipped`, and/or `settledBy: 'continue'` to let the turn go on now.
+   *
+   * WHY the owner is THIS conversation's runtime session: Hermes resolves the
+   * operation by `(owner, op_id)` and refuses an answer from a session that
+   * does not own it (methods_connectors._operation_for_request), which is
+   * also what keeps a stale card from answering a newer operation.
+   */
+  async respondConnection(opId: string, answer: { targets?: Array<{ name: string; status: 'approved' | 'skipped'; env?: Record<string, string> }>; settledBy?: 'continue' }): Promise<{ settled: boolean }> {
+    const connection = this.connection
+    const runtime = this.reconciler.currentRuntimeSessionId
+    if (!connection?.isOpen || !runtime) throw new HermesPromptError('not-ready', 'Hermes is not connected.')
+    const result = await connection.call<{ status?: string; settled?: boolean }>('connection.respond', {
+      op_id: opId,
+      owner: { session_id: runtime, type: 'session' },
+      result: {
+        targets: answer.targets ?? [],
+        ...(answer.settledBy ? { settled_by: answer.settledBy } : {}),
+      },
+    })
+    return { settled: result.settled === true }
+  }
+
   async commandCatalog(): Promise<CommandsCatalogResult> {
     return this.requireConnection().call<CommandsCatalogResult>('commands.catalog', {
       session_id: this.reconciler.currentRuntimeSessionId,
