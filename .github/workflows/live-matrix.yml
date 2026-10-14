@@ -12,6 +12,15 @@
 name: Live matrix
 
 on:
+  # On PRs that touch the client or the corpus, so a release-sensitive change
+  # is checked against both Hermes releases before merge (and because
+  # workflow_dispatch only exists once this file is on main).
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'research/corpus/**'
+      - 'scripts/setup-live-hermes.mjs'
+      - '.github/workflows/live-matrix.yml'
   workflow_dispatch:
   schedule:
     - cron: '17 6 * * 1'
