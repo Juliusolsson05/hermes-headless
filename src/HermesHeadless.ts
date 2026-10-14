@@ -656,6 +656,21 @@ export class HermesHeadless extends EventEmitter {
   }
 
   /**
+   * Let go of the socket but stay resumable: a later reconnect() re-attaches
+   * the same conversation. For a consumer whose credentials died (signed
+   * out): unlike stop(), a fresh sign-in can bring the pane back without
+   * rebuilding it (owner's debug bundle 2026-10-14T16-26-49, a pane that
+   * stayed dead until Reload Agent).
+   */
+  async detach(): Promise<void> {
+    // Invalidates a dial in flight, like stop().
+    this.connectGeneration += 1
+    const connection = this.connection
+    this.connection = null
+    connection?.close(1000, 'client-detach')
+  }
+
+  /**
    * Detach. Deliberately NOT `session.close`: closing a pane must not end
    * the conversation (it stays resumable, and Hermes' reaper owns cleanup).
    */
