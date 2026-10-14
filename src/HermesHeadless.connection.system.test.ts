@@ -80,11 +80,54 @@ describe('a connection operation (recorded S26)', () => {
 })
 
 describe('an OAuth catalog install (recorded S27)', () => {
-  it('carries its browser instructions and no link (a catalog OAuth runs on the server, not via a minted URL)', async () => {
+  it('carries its browser instructions and, while pending, no link (the authorization URL comes only after an approval)', async () => {
     const h = await started('S27')
     h.socket().push(h.connectionFrames[0])
     expect(h.operations[0]!.targets[0]).toMatchObject({ name: 'airtable', action: 'install', connectUrl: null })
     expect(h.operations[0]!.targets[0]!.instructions).toContain('authorize with\nAirtable')
     await h.headless.stop()
+  })
+})
+
+describe('only this conversation\'s operations', () => {
+  it('ignores an account-owned update Hermes broadcasts to every socket (review A F1)', async () => {
+    const h = await started('S26')
+    // Mechanical mutation of the recorded update into the broadcast shape
+    // (methods_connectors._connection_update for an `account:` session key):
+    // empty envelope session id, owner {type:'account'}, no connect_url.
+    const update = h.connectionFrames[1] as { params: { payload: Record<string, unknown> } }
+    h.socket().push({ jsonrpc: '2.0', method: 'event', params: { ...update.params, session_id: '', payload: { ...update.params.payload, owner: { type: 'account' } } } })
+    // Another session's operation on the same gateway.
+    h.socket().push({ jsonrpc: '2.0', method: 'event', params: { ...update.params, payload: { ...update.params.payload, owner: { type: 'session', session_id: 'someone-else' } } } })
+    expect(h.operations).toEqual([])
+    await h.headless.stop()
+  })
+})
+
+describe('parsing what a card may act on', () => {
+  const recordedPayload = () => {
+    const entries = latestRecording('S26', { release: 'v0.22.0' }).filter((entry) => entry.kind === 'ws' && entry.dir === 'in')
+    return (entries.find((entry) => (entry.frame.params as { type?: string } | undefined)?.type === 'connection.request')!.frame.params as { payload: Record<string, unknown> }).payload
+  }
+
+  it('keeps only http(s) sign-in links (review B F3)', async () => {
+    const { connectionOperation } = await import('./index.js')
+    const payload = recordedPayload()
+    const target = (payload.targets as Array<Record<string, unknown>>)[0]!
+    for (const [url, kept] of [['https://connect.example/start', 'https://connect.example/start'], ['javascript:alert(1)', null], ['data:text/html,x', null], ['not a url', null]] as const) {
+      expect(connectionOperation({ ...payload, targets: [{ ...target, connect_url: url }] })!.targets[0]!.connectUrl).toBe(kept)
+    }
+  })
+
+  it('carries a catalog row\'s tier, scan and source so the user can judge it (review B F1)', async () => {
+    const { connectionOperation } = await import('./index.js')
+    const payload = recordedPayload()
+    const target = (payload.targets as Array<Record<string, unknown>>)[0]!
+    // Mechanical mutation into a catalog plugin row (contract fields, connectors_operation.py).
+    const row = { ...target, name: 'acme-tools', kind: 'plugin', tier: 'community', repo: 'acme/tools', sha: 'abc123', description: 'Acme helpers', scan: { status: 'failed', summary: '2 critical findings' } }
+    expect(connectionOperation({ ...payload, targets: [row] })!.targets[0]!.catalog).toEqual({
+      display: null, description: 'Acme helpers', tier: 'community', repo: 'acme/tools', sha: 'abc123', scan: { status: 'failed', summary: '2 critical findings' },
+    })
+    expect(connectionOperation(payload)!.targets[0]!.catalog).toBeNull()
   })
 })

@@ -98,6 +98,11 @@ export type ReconcilerOutput = {
    */
   connection?(operation: HermesConnectionOperation): void
   /**
+   * The session's open operation as of a resume/activate snapshot (null:
+   * none). Replaces whatever the consumer held: see applySnapshot.
+   */
+  connectionSync?(operation: HermesConnectionOperation | null): void
+  /**
    * The answer to `/bg` or `/btw`. NOT a turn: `/btw` is answered "from a
    * snapshot … history, alternation and prompt cache stay untouched"
    * (methods_prompt.py), and `/bg` runs in its own session. The consumer
@@ -154,11 +159,32 @@ export type HermesConnectionTarget = {
   detail: string | null
   /** Setup text written for the user (the card's body). */
   instructions: string | null
-  /** The browser sign-in link a hosted connector minted; absent for catalog installs. */
+  /**
+   * A browser sign-in link, once Hermes has one: a hosted connector's minted
+   * link, or an OAuth catalog install's authorization URL after it was
+   * approved (absent while pending, recorded S27). A catalog OAuth link
+   * redirects to 127.0.0.1 ON THE HERMES HOST (mcp_oauth.py), so on a remote
+   * Hermes it can only complete through a tunnel or `hermes mcp login` there.
+   */
   connectUrl: string | null
   /** Credentials an install still needs; values go back with an approval. */
   requiredEnv: Array<{ name: string; prompt: string | null; required: boolean; secret: boolean; default: string }>
   alias: string | null
+  /**
+   * Catalog rows (kind `plugin` / `skill`) only: what Hermes gives a card so
+   * the user can judge third-party code before it is installed on their
+   * server (connectors_operation.py, "read-only on the card"). Review B F1:
+   * without them the card offered a one-click install of a community plugin
+   * whose security scan had failed.
+   */
+  catalog: {
+    display: string | null
+    description: string | null
+    tier: string | null
+    repo: string | null
+    sha: string | null
+    scan: { status: string; summary: string } | null
+  } | null
 }
 
 export type HermesNotice = {
@@ -295,6 +321,14 @@ export class ConversationReconciler {
   ): void {
     this.runtimeSessionId = result.session_id
     this.storedSessionId = String(result.stored_session_id ?? (result as { resumed?: string }).resumed ?? this.storedSessionId)
+    // Hermes puts the session's open connection operation (or nothing) in
+    // every resume/activate snapshot as `pending_connection`, "so a client
+    // that missed the event (or restarted) restores the card with the
+    // server's deadline" (tui_gateway/server.py). It is the authority after
+    // a reconnect (review A F4): an operation that settled while we were
+    // away, or died with a gateway restart, has no settle frame to wait for.
+    const pending = (result as { pending_connection?: unknown }).pending_connection
+    this.out.connectionSync?.(pending ? connectionOperation(pending) : null)
     this.info = result.info ?? this.info
     this.title = typeof result.info?.title === 'string' && result.info.title ? result.info.title : this.title
     this.publishSession()
@@ -497,6 +531,15 @@ export class ConversationReconciler {
       }
       case 'connection.request':
       case 'connection.update': {
+        // ONLY this conversation's operations (review A F1). An operation
+        // owned by the ACCOUNT (connected from Hermes Desktop or dashboard
+        // Settings on the same gateway) is broadcast to every socket with an
+        // empty session id and `owner: {type: 'account'}`; without this
+        // check it became a card in every Agent Code pane, which no pane
+        // could answer (Hermes resolves an answer by its owner: 4004).
+        const owner = (payload as { owner?: { type?: unknown; session_id?: unknown } } | null)?.owner
+        if (owner && owner.type !== 'session') return
+        if (owner && typeof owner.session_id === 'string' && owner.session_id !== this.runtimeSessionId) return
         const operation = connectionOperation(payload)
         if (operation) this.out.connection?.(operation)
         return
@@ -899,10 +942,19 @@ export function connectionOperation(payload: unknown): HermesConnectionOperation
       kind: String(target.kind ?? ''),
       action: String(target.action ?? ''),
       state: String(target.state ?? 'pending'),
-      resolved: target.resolved === true,
+      // Hermes always sends `resolved` today, but the contract types it
+      // optional (review A F6); absent, derive it with Hermes' own rule
+      // (tools/connectors/contract.py `resolves`), or a finished row would
+      // offer Skip/Connect again.
+      resolved: typeof target.resolved === 'boolean'
+        ? target.resolved
+        : target.state === 'connected' || target.state === 'skipped' || (target.state === 'failed' && (target.kind === 'plugin' || target.kind === 'skill')),
       detail: str(target.detail),
       instructions: str(target.instructions),
-      connectUrl: str(target.connect_url),
+      // http(s) only (review B F3): the link can come from a third-party MCP
+      // server's OAuth metadata, and a consumer hands it to a browser (the
+      // phone client's window.open). Hermes' own client accepts the same.
+      connectUrl: httpUrl(target.connect_url),
       requiredEnv: Array.isArray(target.required_env)
         ? target.required_env.flatMap((field) => {
           if (!field || typeof field !== 'object' || typeof (field as { name?: unknown }).name !== 'string') return []
@@ -911,6 +963,18 @@ export function connectionOperation(payload: unknown): HermesConnectionOperation
         })
         : [],
       alias: str(target.alias),
+      catalog: target.kind === 'plugin' || target.kind === 'skill'
+        ? {
+          display: str(target.display),
+          description: str(target.description),
+          tier: str(target.tier),
+          repo: str(target.repo),
+          sha: str(target.sha),
+          scan: target.scan && typeof target.scan === 'object' && typeof (target.scan as { status?: unknown }).status === 'string'
+            ? { status: String((target.scan as { status: string }).status), summary: String((target.scan as { summary?: unknown }).summary ?? '') }
+            : null,
+        }
+        : null,
     })
   }
   const deadline = typeof raw.deadline_at === 'number' ? Math.round(raw.deadline_at * 1000) : null
@@ -924,5 +988,15 @@ export function connectionOperation(payload: unknown): HermesConnectionOperation
     settledBy: str(raw.settled_by),
     toolCallId: str(raw.tool_call_id),
     targets,
+  }
+}
+
+function httpUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value) return null
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : null
+  } catch {
+    return null
   }
 }

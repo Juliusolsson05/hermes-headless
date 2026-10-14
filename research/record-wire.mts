@@ -756,6 +756,24 @@ const scenarios: Scenario[] = [
       peer.close()
     },
   },
+  {
+    id: 'S28',
+    title: 'connection.request (oauth) APPROVED: the install moves to initiated with its authorization link; then Continue',
+    async run(ctx) {
+      const peer = await connect(ctx)
+      const { sid } = await createSession(peer)
+      await prompt(peer, sid, '[[hh:connect-oauth]] Connect Airtable.')
+      const request = await peer.waitFor((frame) => eventType(frame) === 'connection.request', 60_000)
+      const payload = (request.params as { payload: { op_id: string; targets: Array<{ name: string }> } }).payload
+      await peer.call('connection.respond', { op_id: payload.op_id, owner: { session_id: sid, type: 'session' }, result: { targets: [{ name: 'airtable', status: 'approved' }] } })
+      // Give the install its OAuth discovery; record every update it publishes.
+      await sleep(15_000)
+      await peer.call('connection.respond', { op_id: payload.op_id, owner: { session_id: sid, type: 'session' }, result: { targets: [], settled_by: 'continue' } }).catch((error: Error) =>
+        ctx.tap.note('continue refused', { message: error.message }))
+      await turnComplete(peer, sid)
+      peer.close()
+    },
+  },
 ]
 
 // `--release <tag>` names the Hermes release under HERMES_LIVE_RUNTIME (default

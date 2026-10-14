@@ -243,6 +243,7 @@ export class HermesHeadless extends EventEmitter {
       noticeCleared: (key: string) => this.emit('notice-cleared', { key }),
       sideAnswer: (answer: HermesSideAnswer) => this.emit('side-answer', answer),
       connection: (operation: HermesConnectionOperation) => this.emit('connection-operation', operation),
+      connectionSync: (operation: HermesConnectionOperation | null) => this.emit('connection-sync', operation),
     }, options.toolResults)
   }
 
