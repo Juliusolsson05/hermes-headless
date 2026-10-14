@@ -236,12 +236,39 @@ export class HermesHeadless extends EventEmitter {
     await this.reattach(connection)
   }
 
-  /** Re-attach by stored id on the current (or a fresh) connection. */
+  /**
+   * Re-attach by stored id on the current (or a fresh) connection.
+   *
+   * A conversation deleted on the server while we were away (Hermes Desktop,
+   * the CLI) answers 4007, exactly as at start(). It gets the same fallback:
+   * a NEW conversation announced with `session-replaced`. Without it the
+   * error escaped to the consumer's reconnect loop, which redialled forever
+   * against a server that was perfectly reachable (round-1 review c1 #1).
+   */
   private async reattach(connection?: RpcConnection): Promise<void> {
     const stored = this.reconciler.currentStoredSessionId
     if (!stored) throw new Error('Cannot re-attach: this conversation has no stored id yet.')
     const live = connection ?? (this.connection?.isOpen ? this.connection : await this.connect())
-    await this.attachByResume(live, stored)
+    try {
+      await this.attachByResume(live, stored)
+    } catch (error) {
+      if (!(error instanceof RpcError) || error.code !== SESSION_NOT_FOUND) throw error
+      this.emit('session-replaced', { previousStoredSessionId: stored, reason: 'not-found' })
+      await live.acquire(
+        () => live.call<SessionCreateResult>('session.create', { source: this.createSource(), cols: 96 }),
+        (created) => {
+          // A different conversation: history resets as for `/new`.
+          this.reconciler.beginNewConversation(created)
+          this.watermarks.clear()
+          this.pendingTurns = 0
+          return { fromSeq: null }
+        },
+      )
+    }
+  }
+
+  private createSource(): string {
+    return this.options.target.mode === 'create' ? this.options.target.source : 'agent-code'
   }
 
   /**
@@ -328,7 +355,7 @@ export class HermesHeadless extends EventEmitter {
     }
     await connection.acquire(
       () => connection.call<SessionCreateResult>('session.create', {
-        source: this.options.target.mode === 'create' ? this.options.target.source : 'agent-code',
+        source: this.createSource(),
         cols: 96,
       }),
       (created) => {

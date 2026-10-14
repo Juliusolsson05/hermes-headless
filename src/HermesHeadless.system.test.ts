@@ -372,4 +372,27 @@ describe('commands (package review B #2 survivors)', () => {
     await second.answerCall('session.history', { count: 0, messages: [] })
     await reconnecting
   })
+
+  it('starts a new conversation when the stored one was deleted while away (4007 on reconnect)', async () => {
+    // Round-1 review c1 #1: the conversation is deleted on the server (Hermes
+    // Desktop or the CLI) while the socket is down. The resume answers 4007
+    // exactly as at start(); before this, reconnect() threw it to the
+    // consumer's backoff loop, which then redialled forever.
+    const { h, socket, created } = await started()
+    const replaced: unknown[] = []
+    h.headless.on('session-replaced', (event: unknown) => replaced.push(event))
+    const next = firstResult(sessionEvents('S4').frames, (result) => typeof result.stored_session_id === 'string' && result.message_count === 0)
+    socket.close(4000, 'drop')
+    const reconnecting = h.headless.reconnect()
+    const second = await h.nextSocket()
+    // A restarted server (new epoch, recorded S11 shape): straight to resume.
+    await handshake(second, 'epoch-2')
+    const resume = await second.nextSent((frame) => frame.method === 'session.resume')
+    second.push({ jsonrpc: '2.0', id: resume.id, error: { code: 4007, message: 'session not found' } })
+    await second.answerCall('session.create', next)
+    await second.answerCall('session.events.since', ring([]))
+    await reconnecting
+    expect(replaced).toEqual([{ previousStoredSessionId: created.stored_session_id, reason: 'not-found' }])
+    expect(h.headless.storedSessionId).toBe(next.stored_session_id)
+  })
 })

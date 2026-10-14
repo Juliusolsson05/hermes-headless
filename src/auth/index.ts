@@ -95,6 +95,12 @@ export function normalizeBaseUrl(raw: string): string {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`The Hermes URL must start with http:// or https://, got ${parsed.protocol}`)
   }
+  // `https://user:pass@host` can never work (fetch refuses URLs carrying
+  // credentials) and the consumer would store and display the password in
+  // plain text. Refuse it, without echoing what was typed (round-1 review c1 #3).
+  if (parsed.username || parsed.password) {
+    throw new Error('Remove the user name and password from the Hermes URL. Sign in with the button instead; a reverse proxy that needs its own password is not supported.')
+  }
   parsed.hash = ''
   parsed.search = ''
   parsed.pathname = parsed.pathname.replace(/\/+$/, '')

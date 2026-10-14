@@ -165,6 +165,9 @@ describe('URLs', () => {
     expect(normalizeBaseUrl('100.64.0.1:9119')).toBe('http://100.64.0.1:9119')
     expect(normalizeBaseUrl(' https://vps.example/hermes/ ')).toBe('https://vps.example/hermes')
     expect(() => normalizeBaseUrl('ftp://x')).toThrow(/http/)
+    // Credentials in the URL: refused, and never echoed back.
+    expect(() => normalizeBaseUrl('https://alice:s3cret@vps.example/hermes')).toThrow(/user name and password/)
+    expect(() => normalizeBaseUrl('https://alice:s3cret@vps.example/hermes')).not.toThrow(/s3cret/)
     expect(endpoint('https://vps.example/hermes', '/api/status')).toBe('https://vps.example/hermes/api/status')
   })
 
