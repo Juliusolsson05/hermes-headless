@@ -298,7 +298,14 @@ export class HermesHeadless extends EventEmitter {
         // it as running and nothing would ever settle it, so dispatch the
         // ring from its `message.complete` (round-1 review c2 #3). Deltas in
         // that window are not replayed; the history fetch commits the answer.
-        const fromSeq = turnStart ?? (resumed.running ? lastTurnEnd(ring.events, resumed.session_id) : null)
+        //
+        // ONLY for a truncated ring whose snapshot holds a partial answer: a
+        // prompt Hermes accepted but has not started yet also snapshots as
+        // running with no start in the ring, and there the last completion is
+        // the PREVIOUS turn's; settling on it replayed an old answer and let
+        // the next prompt redirect the running one (round-2 review c1 #1).
+        const evictedStart = ring.truncated === true && typeof resumed.inflight?.assistant === 'string' && resumed.inflight.assistant.length > 0
+        const fromSeq = turnStart ?? (resumed.running && evictedStart ? lastTurnEnd(ring.events, resumed.session_id) : null)
         return { fromSeq }
       },
     )

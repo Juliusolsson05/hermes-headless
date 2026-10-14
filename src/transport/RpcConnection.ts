@@ -254,13 +254,11 @@ export class RpcConnection extends EventEmitter {
    *   3. read the ring for the attached runtime id from `lastSeen`;
    *   4. `plan(result, ring)` applies the snapshot and says from which seq the
    *      RING should be dispatched (null: none, the snapshot covers it);
-   *   5. dispatch those ring events in seq order, then move the watermark to
-   *      the ring head;
-   *   6. surface the RING's open requests (current as of step 3, never the
-   *      older snapshot's);
-   *   7. release the parked events (only seq > watermark: anything older was
-   *      in the ring), in arrival order, so a cancel received while settling
-   *      closes the card it cancels.
+   *   5. dispatch those ring events in seq order (the watermark follows the
+   *      events dispatched, never the ring's head; see below);
+   *   6. surface the held live requests, then the ring's other open requests;
+   *   7. release the parked events in arrival order, dropping only those at
+   *      or below the watermark.
    */
   async acquire<T extends { session_id: string }>(
     attach: () => Promise<T>,
@@ -278,45 +276,75 @@ export class RpcConnection extends EventEmitter {
         last_seen: lastSeen,
       }, 10_000)
     } catch (error) {
-      // No ring to judge them by: surface the held live frames as they came.
+      // No ring to judge them by. On a connection that is gone (stop(),
+      // sign-out) nothing is published: the consumer has already let go, and
+      // a request surfaced now would reopen a card no one can answer
+      // (round-2 review c1 #4, failure A). Otherwise the held live requests
+      // go first and the parked events after them, so a cancel received
+      // while attaching still closes its card (failure B).
       const held = this.acquiringRequests
       this.acquiringRequests = []
-      this.releaseAcquired()
-      for (const request of held) this.surfaceRequest(request.id, request.method, request.params, false)
+      if (this.closed) {
+        this.acquiring = null
+      } else {
+        for (const request of held) this.surfaceRequest(request.id, request.method, request.params, false)
+        this.releaseAcquired()
+      }
       throw error
     }
     const sid = result.session_id
+    const parked = this.acquiring ?? []
     const { fromSeq } = plan(result, ring)
-    const head = typeof ring.latest_seq === 'number' ? ring.latest_seq : 0
+    const ringEvents = ring.events
+      .map(envelopeFromReplay)
+      .filter((event): event is EventEnvelope => event !== null && event.session_id === sid && typeof event.seq === 'number')
+      .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
     if (fromSeq !== null) {
+      // Replay the ring from `fromSeq`; each dispatch moves the watermark,
+      // and the parked live copies of those events then drop as duplicates.
       this.options.watermarks.set(sid, fromSeq - 1)
-      const events = ring.events
-        .map(envelopeFromReplay)
-        .filter((event): event is EventEnvelope => event !== null && event.session_id === sid)
-        .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
-      for (const event of events) this.dispatchSequenced(event, true)
+      for (const event of ringEvents) this.dispatchSequenced(event, true)
+    } else {
+      // The snapshot covers every event BEFORE the rebind. Hermes routes the
+      // session's events to this socket from the rebind on, so a ring event
+      // that also arrived live (parked) is post-rebind and must still be
+      // dispatched; only the ones that did not are covered.
+      const liveSeqs = new Set(parked.filter((event) => event.session_id === sid).map((event) => event.seq))
+      const covered = ringEvents.map((event) => event.seq as number).filter((seq) => !liveSeqs.has(seq))
+      if (covered.length > 0) this.options.watermarks.set(sid, Math.max(this.options.watermarks.get(sid) ?? 0, ...covered))
     }
-    this.options.watermarks.set(sid, Math.max(this.options.watermarks.get(sid) ?? 0, head))
-    // The ring is AUTHORITATIVE for what is open (step 6), even for an id this
-    // socket already surfaced: `plan` may have just closed every card as
-    // superseded (a resume snapshot does), and the connection-wide dedupe
-    // then kept the ring from reopening a request Hermes is still waiting on
-    // (round-1 review c2 #1: a live approval arriving mid-resume, or one open
-    // across a truncated reconnect, vanished for good). The reconciler's own
-    // dedupe keeps a card that is still open from appearing twice.
+    // WHY no jump to `latest_seq` (round-2 review c1 #3): Hermes reads the
+    // ring's events and its head under separate locks
+    // (methods_session.py session.events.since → event_replay), so an event
+    // stamped between the two reads is counted in the head but missing from
+    // the list. Jumping to the head then dropped its live copy as a
+    // duplicate: a message.complete lost, a turn that never settled.
+    //
+    // Requests (step 6). A live frame held during the attach is SHOWN even
+    // when the ring omits it: the ring's open-request list is built before
+    // its reply is written, so a request registered in between reaches us
+    // first and is missing from the list (round-2 review c1 #2). One that was
+    // cancelled while we attached is closed by its parked request.cancel,
+    // released just below in arrival order. The ring still re-delivers what
+    // is open without a live frame here (a reconnect), and stays the
+    // authority over a snapshot that closed cards as superseded (round-1
+    // review c2 #1); the reconciler's dedupe keeps a still-open card single.
     const heldLive = new Map(this.acquiringRequests.map((request) => [request.id, request]))
     this.acquiringRequests = []
-    for (const request of ring.open_requests ?? []) {
-      // A request whose live frame reached THIS socket (now or before) stays
-      // live, so its answer still goes back as a response frame.
-      const held = heldLive.get(request.id)
-      const live = held !== undefined || (this.surfacedRequests.has(request.id) && !this.replayedRequests.has(request.id))
+    for (const request of heldLive.values()) {
       this.surfacedRequests.delete(request.id)
       this.replayedRequests.delete(request.id)
-      this.surfaceRequest(request.id, request.method, held?.params ?? request.params ?? {}, !live)
+      this.surfaceRequest(request.id, request.method, request.params, false)
     }
-    // A held frame the ring no longer lists was answered or cancelled while
-    // we attached; it is not surfaced at all.
+    for (const request of ring.open_requests ?? []) {
+      if (heldLive.has(request.id)) continue
+      // A request whose live frame reached THIS socket before the attach
+      // stays live, so its answer still goes back as a response frame.
+      const live = this.surfacedRequests.has(request.id) && !this.replayedRequests.has(request.id)
+      this.surfacedRequests.delete(request.id)
+      this.replayedRequests.delete(request.id)
+      this.surfaceRequest(request.id, request.method, request.params ?? {}, !live)
+    }
     this.releaseAcquired()
     return { result, ring }
   }

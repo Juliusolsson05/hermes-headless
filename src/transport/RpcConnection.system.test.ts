@@ -132,10 +132,12 @@ describe('replay across a dropped socket (recorded S8)', () => {
 })
 
 describe('server requests', () => {
-  it('a snapshot-only attach moves the watermark to the ring head, so parked events it covers do not dispatch twice', async () => {
-    // Package review c2 survivor M03. A resume snapshot already contains
-    // everything up to the ring head; an event parked during the attach with
-    // a seq at or below it must not be dispatched on top of the snapshot.
+  it('a snapshot-only attach treats pre-rebind ring events as covered and dispatches everything that arrived live', async () => {
+    // Round-2 review c1 #3 replaced the earlier "jump to the ring head" rule:
+    // Hermes reads the ring's events and its head under separate locks, so
+    // an event stamped between them is counted in the head but missing from
+    // the list, and its live copy must still be dispatched. Ring events that
+    // did NOT also arrive live predate the rebind and are in the snapshot.
     const { sid, events } = s8TurnEvents()
     const watermarks = new Map<string, number>()
     const { socket, connection, events: delivered } = await openConnection(watermarks)
@@ -144,13 +146,14 @@ describe('server requests', () => {
       () => ({ fromSeq: null }),
     )
     const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
-    socket.push(eventFrame(events[3]))
-    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
-    await socket.answerCall('session.events.since', { events: [], latest_seq: events[4].seq, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [] })
-    await acquiring
-    expect(delivered).toEqual([])
     socket.push(eventFrame(events[5]))
-    expect(delivered.map((event) => event.seq)).toEqual([events[5].seq])
+    socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
+    // The ring copy holds 3..5 (5 also arrived live) and counts 6 in its head.
+    await socket.answerCall('session.events.since', { events: events.slice(3, 6), latest_seq: events[6].seq, truncated: false, count: 3, epoch: 'epoch-1', open_requests: [] })
+    await acquiring
+    socket.push(eventFrame(events[6]))
+    expect(delivered.map((event) => event.seq)).toEqual([events[5].seq, events[6].seq])
+    expect(watermarks.get(sid)).toBe(events[6].seq)
   })
 
   it('re-delivers the open approval from the recorded S10 ring and answers it through request.answer', async () => {
@@ -218,20 +221,34 @@ describe('server requests', () => {
     expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: live.id, result: { choice: 'deny' } })
   })
 
-  it('drops a held request the ring no longer lists (answered or cancelled while attaching)', async () => {
-    const live = inboundFrames(latestRecording('S5')).find((frame) => frame.method === 'approval')!
-    const sid = String((live.params as { session_id: string }).session_id)
-    const { socket, connection, requests } = await openConnection(new Map())
+  it('a held request is shown even when the ring omits it, and its held cancel then closes it in order', async () => {
+    // Round-2 review c1 #2: the ring's open-request list is built before its
+    // reply is written, so a request registered in between arrives first and
+    // is missing from the list; dropping it lost a live approval. A request
+    // cancelled while we attached is closed by its parked request.cancel,
+    // which is released AFTER the request (recorded S5 approval and cancel).
+    const frames = inboundFrames(latestRecording('S5'))
+    const cancelEvent = frames.find((frame) => frame.method === 'event' && (frame.params as { type: string }).type === 'request.cancel')!.params as Record<string, unknown>
+    const cancelledId = (cancelEvent.payload as { id: string }).id
+    const approval = frames.find((frame) => frame.method === 'approval' && frame.id === cancelledId)!
+    const sid = String((approval.params as { session_id: string }).session_id)
+    const { socket, connection, requests, events } = await openConnection(new Map())
+    const order: string[] = []
+    connection.on('request', (request: ServerRequest) => order.push(`request:${request.id}`))
+    connection.on('event', (event: EventEnvelope) => order.push(`event:${event.type}`))
     const acquiring = connection.acquire(
       () => connection.call<{ session_id: string }>('session.resume', { session_id: 'stored' }),
       () => ({ fromSeq: null }),
     )
     const resume = await socket.nextSent((frame) => frame.method === 'session.resume')
-    socket.push(live)
+    socket.push(approval)
+    socket.push(eventFrame({ ...cancelEvent, session_id: sid }))
     socket.push({ jsonrpc: '2.0', id: resume.id, result: { session_id: sid } })
     await socket.answerCall('session.events.since', { events: [], latest_seq: 0, truncated: false, count: 0, epoch: 'epoch-1', open_requests: [] })
     await acquiring
-    expect(requests).toEqual([])
+    expect(requests.map((request) => request.id)).toEqual([cancelledId])
+    expect(order).toEqual([`request:${cancelledId}`, 'event:request.cancel'])
+    expect(events).toHaveLength(1)
   })
 })
 
