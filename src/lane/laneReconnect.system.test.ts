@@ -207,3 +207,217 @@ describe('a submit that stays refused after re-attaching (agent-code#1527)', () 
     await headless.stop()
   })
 })
+
+// Review round of agent-code#1529. Same fixtures: recorded T5 traffic, the
+// mechanical 4001 of `_sess_nowait`, and (for the lane move) a descendant
+// chain like the one compression or a /new produces, served by the REST
+// fake exactly as `latestDescendant` answers it.
+
+async function started(target: ConstructorParameters<typeof HermesHeadless>[0]['target'], socket: FakeSocket, rest: HermesRest, answer: Parameters<typeof playServer>[1], now?: () => number) {
+  const headless = new HermesHeadless({ target, rest, dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000, ...(now ? { now } : {}) })
+  playServer(socket, answer)
+  const starting = headless.start()
+  await flush()
+  socket.push(READY_FRAME())
+  await starting
+  return headless
+}
+
+describe('overlapping recoveries (review of agent-code#1529)', () => {
+  it('two prompts refused together cause ONE resume, and both are sent on the new runtime', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const resumed = resultOf(entries, 'r2')
+    const socket = new FakeSocket()
+    let resumes = 0
+    let releaseResume: (() => void) | null = null
+    const headless = await started({ mode: 'resume', storedSessionId: String(resumed.stored_session_id ?? resumed.session_id) }, socket, recordedRest(firstListing(entries)), (method, params) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      if (method === 'session.resume') {
+        resumes += 1
+        if (resumes === 1) return { result: resumed }
+        return { defer: (send) => { releaseResume = () => send({ result: { ...resumed, session_id: NEW_RUNTIME } }) } }
+      }
+      if (method === 'session.events.since') return { result: RING }
+      if (method === 'session.history') return { result: resultOf(entries, 'r3') }
+      if (method === 'prompt.submit') return params.session_id === NEW_RUNTIME ? { result: { status: 'queued', user_row_id: 7 } } : { error: NOT_IN_MEMORY }
+      return { result: {} }
+    })
+
+    const first = headless.prompt('First, after the runtime was reaped.')
+    const second = headless.prompt('Second, right behind it.')
+    await waitFor(() => releaseResume !== null, 'the recovery resume')
+    for (let tick = 0; tick < 20; tick += 1) await flush()
+    releaseResume!()
+
+    await expect(first).resolves.toMatchObject({ status: 'queued' })
+    await expect(second).resolves.toMatchObject({ status: 'queued' })
+    expect(resumes).toBe(2)
+    expect(sessionCalls(socket, 'prompt.submit').filter((sid) => sid === NEW_RUNTIME)).toHaveLength(2)
+    await headless.stop()
+  })
+
+  it('a reclaim broadcast during a recovery waits its turn instead of releasing the barrier early', async () => {
+    // The overlap that recoverRuntime cannot prevent: Hermes broadcasts
+    // `session.reclaimed` (session_lifecycle.py _announce_session_reclaimed)
+    // for our conversation while a 4001 recovery's resume is still pending.
+    // The reclaim starts its own attach; when that one REPLACED the barrier,
+    // its refused acquire released it, and a lane refresh read history on the
+    // detached runtime again (Codex reproduced it on T5 traffic).
+    const entries = recordingFor('T5', 'v0.22.0')
+    const resumed = resultOf(entries, 'r2')
+    const oldRuntime = String(resumed.session_id)
+    const socket = new FakeSocket()
+    let resumes = 0
+    let reaped = false
+    let releaseRecovery: (() => void) | null = null
+    const headless = await started({ mode: 'lane', sessionKey: DM }, socket, recordedRest(firstListing(entries)), (method, params) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      if (method === 'session.resume') {
+        resumes += 1
+        if (resumes === 1) return { result: resumed }
+        if (resumes === 2) return { defer: (send) => { releaseRecovery = () => send({ result: { ...resumed, session_id: NEW_RUNTIME } }) } }
+        return { result: { ...resumed, session_id: `${NEW_RUNTIME}-2` } }
+      }
+      if (reaped && params.session_id === oldRuntime) return { error: NOT_IN_MEMORY }
+      if (method === 'session.events.since') return { result: RING }
+      if (method === 'session.history') return { result: resultOf(entries, 'r3') }
+      if (method === 'prompt.submit') return { result: { status: 'streaming', user_row_id: 8 } }
+      return { result: {} }
+    })
+    // Reaped server-side (idle TTL) once the pane is up.
+    reaped = true
+
+    const sending = headless.prompt('Survives a reclaim mid-recovery.')
+    await waitFor(() => releaseRecovery !== null, 'the recovery resume')
+    // From here on the client KNOWS the old runtime is gone (its submit got
+    // 4001); before it, prompt()'s own lane refresh could not have known.
+    const historyBefore = sessionCalls(socket, 'session.history').length
+    socket.push({ jsonrpc: '2.0', method: 'event', params: { type: 'session.reclaimed', session_id: '', payload: { session_id: oldRuntime, stored_session_id: String(resumed.stored_session_id ?? ''), reason: 'ws_orphan_reap' } } })
+    for (let tick = 0; tick < 10; tick += 1) await flush()
+    socket.push({ jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', session_id: '', payload: {} } })
+    for (let tick = 0; tick < 20; tick += 1) await flush()
+    releaseRecovery!()
+
+    await expect(sending).resolves.toMatchObject({ status: 'streaming' })
+    expect(sessionCalls(socket, 'session.history').slice(historyBefore)).not.toContain(oldRuntime)
+    expect(sessionCalls(socket, 'prompt.submit').slice(1)).not.toContain(oldRuntime)
+    await headless.stop()
+  })
+
+  it('a recovery that cannot re-attach reports the prompt as NOT sent, under the refused submit\'s id', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const socket = new FakeSocket()
+    let resumes = 0
+    const headless = await started({ mode: 'lane', sessionKey: DM }, socket, recordedRest(firstListing(entries)), (method) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      if (method === 'session.resume') return (resumes += 1) === 1 ? { result: resultOf(entries, 'r2') } : { error: { code: 5000, message: 'resume failed' } }
+      if (method === 'session.events.since') return { result: RING }
+      if (method === 'session.history') return { result: resultOf(entries, 'r3') }
+      if (method === 'prompt.submit') return { error: NOT_IN_MEMORY }
+      return { result: {} }
+    })
+
+    const error = await headless.prompt('Never accepted.').then(() => null, (failure: unknown) => failure)
+    const submits = socket.sent.filter((frame) => frame.method === 'prompt.submit')
+    expect(submits).toHaveLength(1)
+    expect(error).toBeInstanceOf(HermesPromptError)
+    expect(error).toMatchObject({ kind: 'not-ready', code: 4001, requestId: String(submits[0]!.id) })
+    expect((error as Error).message).toContain('The message was not sent.')
+    await headless.stop()
+  })
+
+  it('a Telegram thread never falls back to a new conversation when the resume answers 4007', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const socket = new FakeSocket()
+    let resumes = 0
+    const headless = await started({ mode: 'lane', sessionKey: DM }, socket, recordedRest(firstListing(entries)), (method) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      // Hermes' transient "session no longer live; retry resume" (4007).
+      if (method === 'session.resume') return (resumes += 1) === 1 ? { result: resultOf(entries, 'r2') } : { error: { code: 4007, message: 'session no longer live; retry resume' } }
+      if (method === 'session.events.since') return { result: RING }
+      if (method === 'session.history') return { result: resultOf(entries, 'r3') }
+      if (method === 'prompt.submit') return { error: NOT_IN_MEMORY }
+      return { result: {} }
+    })
+    const replaced: unknown[] = []
+    headless.on('session-replaced', (event: unknown) => replaced.push(event))
+
+    await expect(headless.prompt('Stays in the thread.')).rejects.toMatchObject({ kind: 'not-ready' })
+    expect(socket.sent.filter((frame) => frame.method === 'session.create')).toEqual([])
+    expect(replaced).toEqual([])
+    await headless.stop()
+  })
+})
+
+describe('a Telegram thread that moves while a refused prompt re-attaches (review of agent-code#1529)', () => {
+  it('the retry goes to the thread\'s new tip, not the conversation it just resumed', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const resumed = resultOf(entries, 'r2')
+    const oldStored = String(resumed.stored_session_id ?? '')
+    const movedStored = `${oldStored}-continued`
+    let moved = false
+    const listing = firstListing(entries)
+    const rest = {
+      listSessions: async () => ({ sessions: listing }),
+      // The descendant chain after the move, as compression or /new leaves it.
+      latestDescendant: async (id: string): Promise<LatestDescendant> => (moved ? { requested_session_id: id, session_id: movedStored, path: [id, movedStored], changed: true } : { requested_session_id: id, session_id: id, path: [id], changed: false }),
+    } as unknown as HermesRest
+    const socket = new FakeSocket()
+    let resumes = 0
+    let releaseRecovery: (() => void) | null = null
+    const headless = await started({ mode: 'lane', sessionKey: DM }, socket, rest, (method, params) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      if (method === 'session.resume') {
+        resumes += 1
+        if (resumes === 1) return { result: resumed }
+        if (params.session_id === movedStored) return { result: { ...resumed, session_id: 'rt-moved', stored_session_id: movedStored } }
+        // The recovery resume of the OLD conversation, held back while the
+        // thread moves on the phone.
+        return { defer: (send) => { releaseRecovery = () => send({ result: { ...resumed, session_id: NEW_RUNTIME } }) } }
+      }
+      if (method === 'session.events.since') return { result: RING }
+      if (method === 'session.history') return { result: resultOf(entries, 'r3') }
+      if (method === 'prompt.submit') return params.session_id === 'rt-moved' ? { result: { status: 'streaming', user_row_id: 9 } } : { error: NOT_IN_MEMORY }
+      return { result: {} }
+    })
+
+    const sending = headless.prompt('Must reach the live conversation.')
+    await waitFor(() => releaseRecovery !== null, 'the recovery resume')
+    moved = true
+    socket.push({ jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', session_id: '', payload: {} } })
+    for (let tick = 0; tick < 20; tick += 1) await flush()
+    releaseRecovery!()
+
+    await expect(sending).resolves.toMatchObject({ status: 'streaming' })
+    expect(sessionCalls(socket, 'prompt.submit').slice(1)).toEqual(['rt-moved'])
+    expect(headless.storedSessionId).toBe(movedStored)
+    await headless.stop()
+  })
+})
+
+describe('"Send now" that fails (review of agent-code#1529)', () => {
+  it('hands the held text back through hold-failed instead of dropping it', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const socket = new FakeSocket()
+    // The recording's clock, 2 s into the phone turn, as in the first test.
+    const phoneRow = (resultOf(entries, 'r4').messages as Array<{ timestamp?: number }>).at(-1)!
+    const clock = phoneRow.timestamp! * 1000 + 2_000
+    const headless = await started({ mode: 'lane', sessionKey: DM }, socket, recordedRest(firstListing(entries)), (method) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      if (method === 'session.resume') return { result: resultOf(entries, 'r2') }
+      if (method === 'session.events.since') return { result: RING }
+      // A running phone turn, so the prompt is held.
+      if (method === 'session.history') return { result: resultOf(entries, 'r4') }
+      if (method === 'prompt.submit') return { error: { code: 4090, message: 'slot limit reached' } }
+      return { result: {} }
+    }, () => clock)
+    const failed: Array<{ holdId: string; text: string }> = []
+    headless.on('hold-failed', (event: { holdId: string; text: string }) => failed.push({ holdId: event.holdId, text: event.text }))
+
+    const held = await headless.prompt('Held, then sent by hand.')
+    expect(held.status).toBe('held')
+    await expect(headless.releaseHeld(held.holdId!)).rejects.toMatchObject({ kind: 'refused', code: 4090 })
+    expect(failed).toEqual([{ holdId: held.holdId, text: 'Held, then sent by hand.' }])
+    await headless.stop()
+  })
+})

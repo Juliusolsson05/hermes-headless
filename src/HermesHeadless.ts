@@ -406,11 +406,27 @@ export class HermesHeadless extends EventEmitter {
   /**
    * Run a re-attach as THE barrier (see `attaching`). Nested callers would
    * deadlock on themselves, so the work never awaits whenAttached().
+   *
+   * WHY attaches QUEUE behind the one in flight instead of replacing it
+   * (review of #1529, both reviewers reproduced it): two can overlap (a
+   * `session.reclaimed` broadcast arriving while a submit's 4001 starts its
+   * recovery, two prompts both answered 4001, a lane move during a
+   * reconnect). The second one's `acquire()` is refused at once ("already
+   * being attached"), and when it simply replaced the barrier, its failure
+   * released the barrier while the FIRST resume was still pending: a held
+   * prompt drained on the detached runtime again, the exact #1527 loss. Now
+   * the barrier is the tail of the queue, so it is held until the last
+   * queued attach finishes, and each attach starts on a free connection.
    */
   private trackAttach(work: () => Promise<void>): Promise<void> {
-    const run = work().finally(() => {
-      if (this.attaching === run) this.attaching = null
-    })
+    const previous = this.attaching
+    // Uncontended, the work starts NOW (synchronously, as before): a reconnect
+    // dials in the same tick, and callers that push the server's first frame
+    // right after rely on the socket already existing.
+    const run: Promise<void> = (previous ? previous.catch(() => undefined).then(work) : work())
+      .finally(() => {
+        if (this.attaching === run) this.attaching = null
+      })
     this.attaching = run
     return run
   }
@@ -474,6 +490,15 @@ export class HermesHeadless extends EventEmitter {
       await this.attachByResume(live, stored)
     } catch (error) {
       if (!(error instanceof RpcError) || error.code !== SESSION_NOT_FOUND) throw error
+      // A Telegram-thread pane never falls back to a NEW conversation: the
+      // gateway would not route the thread to it, so every later message
+      // (the held one first) would land somewhere the phone never sees
+      // (review of #1529; newConversation refuses lane mode for the same
+      // reason). The thread's own tip is the conversation to be in, and a
+      // lane refresh re-resolves it. Hermes also answers 4007 TRANSIENTLY
+      // ("session no longer live; retry resume", session_lifecycle.py
+      // _reattach_refusal), so the caller's retry is the right next step.
+      if (this.options.target.mode === 'lane') throw error
       this.emit('session-replaced', { previousStoredSessionId: stored, reason: 'not-found' })
       await live.acquire(
         () => live.call<SessionCreateResult>('session.create', { source: this.createSource(), cols: 96 }),
@@ -604,7 +629,33 @@ export class HermesHeadless extends EventEmitter {
       // try ONCE more; a second 4001 means re-attaching does not help and the
       // refusal surfaces as before (agent-code#1527).
       if (error instanceof RpcError && error.code === RUNTIME_NOT_IN_MEMORY && !recovering && connection.isOpen) {
-        await this.trackAttach(() => this.reattach(connection))
+        try {
+          await this.recoverRuntime(connection, runtime)
+          // A Telegram thread may have MOVED while we re-attached (a /new on
+          // the phone): the retry must go to the thread's tip, never the
+          // conversation we just resumed because its id could still be
+          // resumed (review of #1529: Hermes reopens an ended row on submit,
+          // so the message went into the abandoned branch). refreshLane
+          // re-resolves the tip, follows a move under the barrier, and
+          // re-reads history. Busy is NOT re-decided: the caller decided to
+          // send moments ago, and `queued: true` still keeps a phone turn
+          // that started meanwhile from being redirected.
+          if (this.options.target.mode === 'lane' && !(await this.refreshLane())) {
+            throw new Error('could not confirm the Telegram thread')
+          }
+        } catch (recoveryError) {
+          // Uncertainty about RE-ATTACHING is not uncertainty about the
+          // message: Hermes refused it with 4001 before accepting anything.
+          // Left raw, a resume timeout or a closed socket here reached the
+          // app as "may or may not have reached Hermes" (review of #1529).
+          // The id is the refused submit's: that is the line in Hermes' log.
+          throw new HermesPromptError(
+            'not-ready',
+            `Hermes lost this conversation's live session and could not re-attach it (${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}). The message was not sent.`,
+            error.code,
+            error.id,
+          )
+        }
         return this.submit(text, true)
       }
       if (error instanceof RpcError) throw new HermesPromptError('refused', error.message, error.code, error.id)
@@ -613,6 +664,20 @@ export class HermesHeadless extends EventEmitter {
       }
       throw error
     }
+  }
+
+  /**
+   * Replace a runtime Hermes no longer holds (`stale`), unless someone else
+   * already is. A re-attach in flight (a reclaim, a reconnect, another
+   * prompt's recovery) is waited for, and only if the runtime is STILL the
+   * stale one afterwards does this start its own. Two prompts answered 4001
+   * together therefore cause one resume, not two (review of #1529).
+   */
+  private async recoverRuntime(connection: RpcConnection, stale: string): Promise<void> {
+    await this.whenAttached()
+    if (this.reconciler.currentRuntimeSessionId !== stale) return
+    if (this.connection !== connection || !connection.isOpen) throw new Error('the connection closed')
+    await this.trackAttach(() => this.reattach(connection))
   }
 
   async interrupt(): Promise<void> {
@@ -957,7 +1022,10 @@ export class HermesHeadless extends EventEmitter {
     const current = this.reconciler.currentStoredSessionId
     if (current && tip !== current) {
       const reason = await this.laneMoveReason(current, tip)
-      await this.attachByResume(connection, tip, reason === 'new-conversation' ? 'new-conversation' : 'snapshot')
+      // Under the barrier like every other re-attach (review of #1529): a
+      // drain started by the previous pass may be submitting right now, and
+      // must wait for the new runtime instead of reading the old one.
+      await this.trackAttach(() => this.attachByResume(connection, tip, reason === 'new-conversation' ? 'new-conversation' : 'snapshot'))
       this.ownUserRowIds.clear()
       // After the move succeeded: a failed re-resume used to announce the
       // move anyway, and the retry announced it again (review).
@@ -1039,7 +1107,17 @@ export class HermesHeadless extends EventEmitter {
     if (index < 0) return null
     const [hold] = this.held.splice(index, 1)
     this.emitLane()
-    const outcome = await this.submit(hold!.text)
+    let outcome: PromptOutcome
+    try {
+      outcome = await this.submit(hold!.text)
+    } catch (error) {
+      // The hold is already out of the list: without this the text existed
+      // nowhere once "Send now" failed, the same loss as #1527 through the
+      // other button (review of #1529). Same event as a failed drain, so the
+      // consumer shows the words once, in one place.
+      this.emit('hold-failed', { holdId, text: hold!.text, error: error instanceof Error ? error : new Error(String(error)) })
+      throw error
+    }
     this.emit('hold-released', { holdId, outcome })
     return outcome
   }
