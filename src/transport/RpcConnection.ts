@@ -38,7 +38,14 @@ export type WebSocketLike = {
 }
 
 export class RpcError extends Error {
-  constructor(readonly code: number, message: string, readonly data?: unknown, readonly method?: string) {
+  /**
+   * `id` is the JSON-RPC request id (`hh<n>`). Hermes' own log names a
+   * rejected call by that id (`rid='hh6'`), so a consumer that logs it can
+   * line its record up with the server's: the 2026-10-15 lost held message
+   * was only diagnosable from the server side because nothing on ours named
+   * the call (agent-code#1527).
+   */
+  constructor(readonly code: number, message: string, readonly data?: unknown, readonly method?: string, readonly id?: string) {
     super(message)
     this.name = 'RpcError'
   }
@@ -431,7 +438,7 @@ export class RpcConnection extends EventEmitter {
         this.pending.delete(classified.id)
         this.clearTimer(pending.timer)
         if (classified.error) {
-          pending.reject(new RpcError(classified.error.code, classified.error.message, classified.error.data, pending.method))
+          pending.reject(new RpcError(classified.error.code, classified.error.message, classified.error.data, pending.method, String(classified.id)))
         } else {
           pending.resolve(classified.result)
         }

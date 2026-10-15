@@ -120,7 +120,8 @@ export type PromptOutcome = {
  * after sending), so resending could run the turn twice.
  */
 export class HermesPromptError extends Error {
-  constructor(readonly kind: 'not-ready' | 'refused' | 'unknown', message: string, readonly code?: number) {
+  /** `requestId`: the refused call's JSON-RPC id, matching Hermes' `rid=` log field (see RpcError). */
+  constructor(readonly kind: 'not-ready' | 'refused' | 'unknown', message: string, readonly code?: number, readonly requestId?: string) {
     super(message)
     this.name = 'HermesPromptError'
   }
@@ -606,7 +607,7 @@ export class HermesHeadless extends EventEmitter {
         await this.trackAttach(() => this.reattach(connection))
         return this.submit(text, true)
       }
-      if (error instanceof RpcError) throw new HermesPromptError('refused', error.message, error.code)
+      if (error instanceof RpcError) throw new HermesPromptError('refused', error.message, error.code, error.id)
       if (error instanceof ConnectionClosedError || error instanceof RpcTimeoutError) {
         throw new HermesPromptError('unknown', `The message may or may not have reached Hermes: ${error.message}`)
       }

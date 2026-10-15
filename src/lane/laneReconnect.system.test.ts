@@ -15,7 +15,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { HermesHeadless, type HermesLaneState } from '../HermesHeadless.js'
+import { HermesHeadless, HermesPromptError, type HermesLaneState } from '../HermesHeadless.js'
 import type { HermesRest, LatestDescendant, SessionListRow } from '../rest/HermesRest.js'
 import { FakeSocket, READY_FRAME } from '../testing/fakeSocket.js'
 import { recordingFor, type CorpusEntry } from '../testing/corpus.js'
@@ -176,6 +176,34 @@ describe('a submit that hits a reaped runtime (agent-code#1527)', () => {
     expect(outcome.status).toBe('streaming')
     expect(sessionCalls(socket, 'prompt.submit')).toEqual([oldRuntime, NEW_RUNTIME])
     expect(resumes).toBe(2)
+    await headless.stop()
+  })
+})
+
+describe('a submit that stays refused after re-attaching (agent-code#1527)', () => {
+  it('retries once, then surfaces the refusal with the request id Hermes logs it under', async () => {
+    const entries = recordingFor('T5', 'v0.22.0')
+    const socket = new FakeSocket()
+    const headless = new HermesHeadless({ target: { mode: 'lane', sessionKey: DM }, rest: recordedRest(firstListing(entries)), dial: async () => socket, heartbeatIntervalMs: 600_000, laneDebounceMs: 1, laneBackstopMs: 600_000 })
+    playServer(socket, (method) => {
+      if (method === 'client.capabilities') return { result: CAPS }
+      if (method === 'session.resume') return { result: resultOf(entries, 'r2') }
+      if (method === 'session.events.since') return { result: RING }
+      if (method === 'session.history') return { result: resultOf(entries, 'r3') }
+      if (method === 'prompt.submit') return { error: NOT_IN_MEMORY }
+      return { result: {} }
+    })
+    const starting = headless.start()
+    await flush()
+    socket.push(READY_FRAME())
+    await starting
+
+    const error = await headless.prompt('Refused twice.').then(() => null, (failure: unknown) => failure)
+    const submits = socket.sent.filter((frame) => frame.method === 'prompt.submit')
+    // Exactly one retry: never a loop against a server that keeps refusing.
+    expect(submits).toHaveLength(2)
+    expect(error).toBeInstanceOf(HermesPromptError)
+    expect(error).toMatchObject({ kind: 'refused', code: 4001, requestId: String(submits[1]!.id) })
     await headless.stop()
   })
 })
